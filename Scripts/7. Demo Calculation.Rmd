@@ -1,0 +1,312 @@
+---
+title: "Example Derivation of Regional Adjustment"
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding=encoding, output_dir=here::here('Results'))})
+output:
+  html_document:
+    toc: true
+    toc_depth: 5
+    toc_float: true
+    df_print: paged
+author: PME
+---
+
+This notebook outlines as transparently as possible the derivation of regional adjustments
+to carbon stocks, the estimation of potential carbon stocks on agricultural land, 
+and the resulting carbon gap.
+
+Based on results, we recommend the top-down, stationary approach for developing 
+regional adjustments to iSDA SOC stock predictions in agricultural lands. This follows
+the flowchart in Supplementary Figure 1. The steps are:
+
+1. Evaluate the relationship between iSDA predictions and empirical measurements 
+of SOC stocks, where iSDA predictions are based on iSDA predictions of both SOC 
+concentrations and bulk density. 
+- *Inputs*: Sampled data; iSDA values at sampled locations.
+- *Outputs*: Regression of empirical data vs iSDA predictions
+2. Use this relationship to adjust iSDA SOC stocks. 
+- *Inputs*: iSDA SOC stocks
+- *Outputs*: Map of adjusted iSDA SOC stocks
+3. Identify edaphic and climatic factors that define soils with similar SOC-
+limiting properties – here, elevation and iSDA-predicted soil texture – through 
+variable selection by LASSO regularized regression.
+- *Inputs*: Adjusted iSDA SOC stocks and empirical soil properties at sample locations
+- *Outputs*: A list of predictors
+4. Use the selected factors to develop a quantile regression relationship between 
+iSDA SOC stocks and the covariates at the threshold of choice - we used the 80th
+percentile, which thus represents an expected upper limit or potential of carbon 
+stocks given soil covariates (we used the 80th percentile).
+- *Inputs*: same as Step 3.
+- *Outputs*:  Quantile regression of adjusted iSDA SOC stocks vs predictors
+5. Use this relationship to predict potential carbon stocks across the region of 
+interest.
+- *Inputs*: Adjusted SOC stocks, layers of other soil properties.
+- *Outputs*: Map of potential SOC stocks 
+6. Calculate carbon gaps as the difference between current and potential stocks, 
+with a floor of zero. 
+- *Inputs*: Derived maps of adjusted SOC stocks and potential SOC stocks
+- *Outputs*: Map of carbon gaps
+
+# Setup
+## Critical Variables
+```{r}
+set_datum = 'epsg:4326'  # WGS84
+set_projection = 'epsg:32736'  # utm 36S.
+
+# output
+overwrite = FALSE
+# overwrite = TRUE
+```
+
+## Data sources
+
+iSDA layers were downloaded individually from Zenodo - see the get_isda notebook.
+These were then combined with SRTM90 (elevation) from google earth engine and
+masked for land suitable for agriculture in Malawi based on Li et al (2017). 
+
+```{r}
+# locations
+in_dir = 'Data'
+in_pt = 'Master Points.gpkg'
+
+dir_spatial = 'Spatial' # in in_dir
+in_isda = 'iSDA_combined_masked.tif'
+# in_suit = 'LI_ETAL_2017_MW_AGRI_LAND_SUIT.tif'  # cropland suitability
+in_mwi = "Malawi gadm36_MWI.gpkg"
+# in_dem = "srtm90_MWI.tif" 
+
+out_dir = 'Results'
+```
+
+## Libraries
+```{r message=FALSE, warnings=FALSE}
+libs = c(
+  # Coding helpers
+  'here', 
+  'magrittr',
+  
+  # spatial stuff
+  'sf',
+  'terra',
+  'stars',
+  
+  # Other modeling
+  'glmnet',
+  'quantreg',
+  
+  # plotting
+  'ggplot2',
+  'rasterVis',
+  'gridExtra'
+)
+
+# load
+for (i in libs) {
+  if (!require(i, character.only=TRUE)) {
+    renv::install(i)
+    require(i, character.only=TRUE)
+  }}
+
+# versions
+sapply(libs, function(x) as.character(packageVersion(x))) %>% 
+  as.matrix %>% 
+  set_colnames(R.version.string)
+```
+
+### Custom Functions
+```{r}
+# calculate carbon stocks based on carbon concentration, bulk density, and depth
+calc_stock = function(carbon, bulk_density, depth) {
+  # units
+  # carbon: decimal_percent (decimals, ex 1% = 0.01)
+  # bulk density: g/cm3
+  # depth: m
+  # returns stock in Mg/ha
+  bulk_density = bulk_density * 100^3 # convert to g/m3
+  ha_volume = 10000 * depth # calc volume per 10000 m2 surface (1 ha)
+  soil_mass = bulk_density * ha_volume / 1E6
+  out = carbon * soil_mass
+
+  return(out)
+}
+
+# use ggplot and rasterVis to plot a terra object. 
+ggmap = function(raster, fill='value', label=NULL) {
+  require(rasterVis)
+  out = gplot(raster) +
+    geom_tile(aes_string(fill=fill)) +
+    scale_fill_distiller(palette='YlGnBu',
+                         direction=1,
+                         na.value=NA) +
+    coord_equal() +
+    labs(fill=label) +
+    labs(x=NULL,
+         y=NULL) +
+    theme_minimal()
+  return(out)
+}
+```
+
+## Load
+
+### iSDA
+```{r fig.height=4, fig.width=8, warning=FALSE}
+isda =  here(in_dir, dir_spatial, in_isda) %>% 
+  rast
+summary(isda)
+```
+This raster stack was combined with elevation data and masked to include only land
+suitable for agriuclture. 
+
+```{r}
+ggmap(isda$ISDA_SOC, label='iSDA SOC\n[g/kg]')
+```
+
+### Point Data
+```{r}
+pt = here(in_dir, in_pt) %>% 
+  st_read
+```
+
+```{r}
+head(pt)
+```
+CGI, EVI, NDVI, SR, and LST are all MODIS/LANDSAT. Only LST is used. 
+
+# Adjust iSDA SOC stocks
+## Calculate estimated SOC stocks, 0-20cm depth
+*Units*
+
+- Bulk density: g ml<sup>-3</sup>
+- Soil Carbon: g kg<sup>-1<sup>
+- Depth: 20 cm
+- Output units: Mg ha<sup>-1</sup>
+```{r}
+calc_stock = function(carbon, bulk_density, depth) {
+  # units
+  # carbon: decimal_percent (decimals, ex 1% = 0.01)
+  # bulk density: g/cm3
+  # depth: m
+  # returns stock in Mg/ha
+  bulk_density = bulk_density * 100^3 # convert to g/m3
+  ha_volume = 10000 * depth # calc volume per 10000 m2 surface (1 ha)
+  soil_mass = bulk_density * ha_volume / 1E6
+  out = carbon * soil_mass
+
+  return(out)
+}
+
+
+pt$ISDA_CSTOCK = 
+  with(pt,
+       calc_stock(ISDA_SOC/1000,  # convert to fraction (decimal)
+                  ISDA_BD,
+                  0.2)
+  )  
+
+
+isda$ISDA_CSTOCK = calc_stock(isda$ISDA_SOC/1000,
+                              isda$ISDA_BD,
+                              0.2)
+```
+
+Predict bulk density with earlier-derived pedotransfer function (or of choice)
+```{r}
+pt$BULK_DENSITY_PEDO = with(pt, 
+                            1.29 - 0.0072*TOTALC + .344*SAND)
+
+pt$CSTOCK_NOW = with(pt, 
+                 calc_stock(TOTALC/1000,
+                            BULK_DENSITY_PEDO,
+                            0.2))
+```
+
+
+## Derive relationship
+```{r}
+isda_adjust = lm(CSTOCK_NOW ~ poly(ISDA_CSTOCK, 2), data=pt)
+summary(isda_adjust)
+```
+```{r}
+pt$ISDA_CSTOCK_NOW = predict(isda_adjust, pt)
+```
+
+```{r}
+with(pt, plot(ISDA_CSTOCK_NOW, 
+              CSTOCK_NOW))
+abline(a=0, b=1, col='blue')
+```
+
+## Map
+```{r}
+adj_stocks = predict(isda,
+                     isda_adjust) %>% 
+  set_names('CSTOCK_NOW')
+```
+
+
+```{r}
+ggmap(adj_stocks$CSTOCK_NOW, label='Carbon Stocks\n[Mg/ha]')
+```
+Spatially similar but with very different ranges to non-adjusted. 
+
+
+# Estimate Potentials
+## Predictors
+```{r}
+# Generate matrices for glmnet
+mm = model.frame(ISDA_CSTOCK_NOW ~
+                   ISDA_SAND + ISDA_SILT + ISDA_CLAY + ELEVATION + LST + PRECIP_DAILY,
+                 data=pt) %>% 
+  as.matrix 
+y = mm[, 1, drop=FALSE]
+x = mm[, -c(1), drop=FALSE]
+
+potential_predictors = cv.glmnet(x, 
+                                 y, 
+                                 alpha=.95) %>% 
+  coef(s='lambda.1se') %T>%
+  print
+```
+
+These are candidate predictors. In the manuscript we only kept those with statistical
+significance which we skip here for clarity. Note that sand, silt, and clay are 
+highly collinear and thus only two are necessary.
+
+## Derive Quantile Relationship to Estimate Potentials
+At the 80th percentile.
+```{r}
+potentials_mod = rq(ISDA_CSTOCK_NOW ~ ISDA_SAND + ISDA_SILT + ISDA_CLAY,
+                   data=pt, 
+                   tau=0.8)
+
+```
+
+## Predict
+```{r}
+adj_stocks$CSTOCK_80 = 
+  predict(isda,
+          potentials_mod,
+          type='none') %>%   # skip calculating errors for the demo.
+  max(adj_stocks$CSTOCK_NOW) # if a location has more carbon than the 80th percentile, use that value.
+```
+
+## Map
+```{r}
+ggmap(adj_stocks$CSTOCK_80,
+      label='Potential Carbon Stocks\n[Mg/ha]')
+```
+
+```{r warning=FALSE}
+summary(adj_stocks)
+```
+
+# Calculate gap
+```{r}
+adj_stocks$CGAP = adj_stocks$CSTOCK_80 - adj_stocks$CSTOCK_NOW
+```
+
+```{r}
+ggmap(adj_stocks$CGAP, label='Carbon Gap\n[Mg/ha]')
+```
+THese are the estimated carbon gaps in agriucltural soils of Malawi.

@@ -1,0 +1,839 @@
+---
+title: "Fig 4 - Updated maps of stocks and gaps"
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding=encoding, output_dir=here::here('Results'))})
+output:
+  html_document:
+    toc: true
+    toc_depth: 5
+    toc_float: true
+    df_print: paged
+    code_folding: hide
+author: PME
+---
+
+Run this after Part 3. 
+
+In this notebook, we will produce updated maps of carbon stocks, storage potentials,
+and gaps. 
+
+The prediction model used will be the top-down stationary model, which performed
+equivalently to the spatial model at unobserved regions and performed better than 
+the bottom-up model.
+
+Goals are:
+1. Predict carbon stocks across the region through updating iSDA
+2. Predict storage potential based on soil properties
+3. Calculate carbon gaps for agricultural land.
+
+
+# Load
+
+## Paths, Variables, Libraries
+
+Variables
+```{r}
+set_datum = 'epsg:4326'  # WGS84
+set_projection = 'epsg:32736'  # utm 36S.
+# output
+overwrite = FALSE
+# overwrite = TRUE
+
+plot_diagnostics = TRUE
+```
+
+Paths
+```{r}
+# locations
+in_dir = 'Data'
+in_pt = 'Master Points.gpkg'
+
+dir_spatial = 'Spatial' # in in_dir
+in_isda = 'ISDA_AR_MWI.tif'
+in_suit = 'LI_ETAL_2017_MW_AGRI_LAND_SUIT.tif'  # cropland suitability
+in_mwi = "Malawi gadm36_MWI.gpkg"
+in_dem = "srtm90_MWI.tif" 
+
+out_dir = 'Results'
+
+# in_isda = c(
+#   'BD',
+#   'CLAY',
+#   # 'SAND',
+#   'SILT',
+#   # 'PH',
+#   'SOC')
+# in_isda = paste0("ISDA_", in_isda)
+# names(in_isda) = in_isda
+# 
+# in_isda = 'ISDA_AR_MWI.png'
+
+```
+
+Libraries
+```{r}
+libs = c(
+  # Coding helpers
+  'here', 
+  # 'tidyr',
+  'magrittr',
+  
+  # spatial stuff
+  'sf',
+  'terra',
+  'stars',
+  
+  # Other modeling
+  'glmnet',
+  'quantreg',
+  
+  # plotting
+  'ggplot2',
+  'rasterVis',
+  'gridExtra'
+)
+```
+
+```{r message=FALSE}
+for (i in libs) {
+  if (!require(i, character.only=TRUE)) {
+    renv::install(i)
+    require(i, character.only=TRUE)
+}}
+
+resource = function() {
+  ll = here('Scripts', 'V3 Functions') %>% 
+  list.files(full.names=TRUE)
+  for (i in ll) {
+    source(i)
+  }
+}
+resource()
+```
+
+Versions
+```{r}
+sapply(libs, function(x) as.character(packageVersion(x))) %>% 
+  as.matrix %>% 
+  set_colnames(R.version.string)
+```
+
+## Load
+```{r}
+load(here(in_dir, 'Fig 2 - Field Estimates.Rdata'))
+load(here(in_dir, 'Part 3 - iSDA Corrections.Rdata'))
+```
+
+### Malawi EPA bounds
+```{r}
+mwi = here(in_dir, dir_spatial, in_mwi) %>% 
+  st_read(layer='gadm36_MWI_1')
+```
+
+### iSDA
+load and convert units
+```{r fig.height=4, fig.width=8, warning=FALSE}
+isda =  here(in_dir, dir_spatial, in_isda) %>% 
+  rast
+summary(isda)
+```
+Looks good. 
+
+### Elevation
+Add directly to iSDA data
+```{r}
+isda$ELEVATION = here(in_dir, dir_spatial, in_dem) %>% 
+  rast %>% 
+  resample(isda, method='near')
+```
+
+### Mask to land suitable for agriculture
+Make a mask that aligns with stocks. Must be in WGS84 with 30m resolution. 
+```{r}
+suit_mask = here(in_dir, dir_spatial, in_suit) %>% 
+  rast
+suit_mask = suit_mask < 5
+suit_mask[!suit_mask] = NA
+suit_mask %<>% 
+  project(isda, align=TRUE, method='near') %>% 
+  crop(isda)
+
+isda %<>% mask(suit_mask)
+```
+#### Export iSDA for the adjustment demo
+```{r}
+here(dir_spatial, "iSDA_combined_masked.tif") %>% 
+  writeRaster(isda,
+              .,
+              overwrite=overwrite)
+```
+
+
+
+### Reproject boundaries
+```{r}
+mwi_utm = st_transform(mwi, set_projection)
+```
+
+
+### A few more functions
+```{r}
+gg_mapthemer = function(x, 
+                        xlab=NULL, 
+                        ylab=NULL,
+                        coord_equal=FALSE) {
+  out = x +
+    labs(x=xlab,
+         y=ylab) +
+    theme_minimal() +
+    theme(axis.text.x=element_text(angle=90, 
+                                   hjust=1, 
+                                   vjust=0.5))
+  if (coord_equal) {
+    out = out + coord_equal()
+  }
+  return(out)
+}
+```
+
+
+```{r}
+ggmap = function(raster, fill='value', label=NULL) {
+  require(rasterVis)
+  out = gplot(raster) +
+    geom_tile(aes_string(fill=fill)) +
+    scale_fill_continuous(na.value=NA) +
+    coord_equal() +
+    labs(fill=label)
+  out = gg_mapthemer(out)
+  return(out)
+}
+ggmap(isda$ISDA_SOC, label='Soil Organic\nCarbon [g/kg]')
+```
+
+
+# Estimate stocks from iSDA corrections
+## Calculate current iSDA Stock Estimates
+
+Excluding "inorganic" carbon.
+```{r}
+isda$ISDA_CSTOCK_NOW = calc_stock(isda$ISDA_SOC/1000, isda$ISDA_BD, 0.2)
+```
+
+## Adjust isda estimates. Place in a new object, "out_stocks". 
+```{r}
+pred = 'CSTOCK_NOW'
+model = current_stocks[['top down stationary']]
+
+predict_se = function(...) predict(..., type='response', se.fit=TRUE)$se.fit
+
+out_stocks = predict(isda,
+                     model,
+                     type='response') %>% 
+  set_names(pred)
+se = predict(isda, 
+             model,
+             fun=predict_se) %>% 
+  set_names(paste0(pred, '_se'))
+
+terra::add(out_stocks) = se
+```
+
+
+
+```{r fig.height=5, fig.width=8}
+grid.arrange(
+  ggmap(out_stocks$CSTOCK_NOW, 
+        label='Corrected\nCarbon Stock\n[Mg/ha]'),
+  ggmap(out_stocks$CSTOCK_NOW_se, 
+        label='Corrected\nCarbon Stock\nError [Mg/ha]'),
+  nrow=1
+)
+```
+
+## Calculate potentials
+Layer called CSTOCK_80. Set floor of current stocks. 
+```{r}
+pred = 'CSTOCK_80'
+model = potential_stocks[['top_stat']]
+
+# predict
+new_layers = predict(isda, 
+                     model,
+                     fun=rast_predict_se)
+
+names(new_layers) = c(
+  pred,
+  paste0(pred, '_se')
+)
+
+# Set floor
+tt = 
+  max(new_layers[[pred]], 
+      out_stocks[['CSTOCK_NOW']])
+
+
+terra::add(out_stocks) = tt
+terra::add(out_stocks) = new_layers[[2]]
+```
+
+
+```{r fig.height=5, fig.width=8}
+grid.arrange(
+  ggmap(out_stocks$CSTOCK_80, 
+        label='Potential\nCarbon Stock\n[Mg/ha]'),
+  ggmap(out_stocks$CSTOCK_80_se, 
+        label='Potential\nCarbon Stock\nError [Mg/ha]'),
+  nrow=1
+)
+```
+
+
+## Calculate gaps
+Layer called CGAP. Min is 0 because of floor for potential stocks.
+```{r}
+gap = out_stocks[['CSTOCK_80']] - out_stocks[['CSTOCK_NOW']]
+names(gap) = 'CGAP'
+terra::add(out_stocks) = gap
+
+
+gap_se = sqrt(out_stocks$CSTOCK_80_se^2 + out_stocks$CSTOCK_NOW_se^2)
+names(gap_se) = 'CGAP_se'
+terra::add(out_stocks) = gap_se
+```
+
+
+```{r fig.height=5, fig.width=8}
+grid.arrange(
+  ggmap(out_stocks$CGAP, 
+        label='Carbon Gap\n[Mg/ha]'),
+  ggmap(out_stocks$CGAP_se, 
+        label='Carbon Gap\nError [Mg/ha]'),
+  nrow=1
+)
+```
+
+## Correlation between stocks and gaps
+```{r}
+tt = spatSample(out_stocks, 1000, na.rm=TRUE) %>% 
+  .[, c('CSTOCK_NOW', 'CGAP')] %>% 
+  cor %>% 
+  round(3)
+```
+
+## Export
+```{r}
+here(out_dir, 'corrected_SOC_stocks_mwi.tif') %>%
+  writeRaster(out_stocks,
+              .,
+              overwrite=overwrite)
+out_stocks = here(out_dir, 'corrected_SOC_stocks_mwi.tif') %>% 
+  rast
+```
+
+# Map
+## Total land area and cell size
+For calculating totals.
+```{r}
+suit_area = cellSize(suit_mask, unit='ha') %>% 
+  global(fun='sum', na.rm=TRUE)
+
+ggmap(suit_mask) +
+  labs(title=paste("Area:", round(suit_area/1e6, 1), 'M ha'))
+```
+
+Cell size for calculating to total 
+```{r}
+cellsize = cellSize(out_stocks$CSTOCK_NOW, 
+                    mask=TRUE, 
+                    unit='ha')
+ggmap(cellsize, label='Cell Size [ha]')
+```
+
+# Figure 4 - Estimated Stocks
+Various pieces:
+
+- aggregated data
+- new, nicer names
+- subtitles of totals across the region with errors. 
+- breaks and ranges for color scales - to ensure stocks and potentials are on
+on the same scale.
+
+```{r fig.height=8}
+data = out_stocks
+is_se = grepl('_se', names(data))
+
+pltdf = data[[!is_se]] %>% 
+  aggregate(fact=10) %>% 
+  project(set_projection)
+
+nn = names(pltdf)
+
+prettynames = c(
+  CSTOCK_NOW = 'Current Stock',# [Mg C/ha]',
+  CSTOCK_80 = 'Potential Stock',
+  CGAP = 'Current Gap',
+  CSTOCK_NOW_se = 'Current Stock Error',
+  CSTOCK_80_se = 'Potential Stock Error',
+  CGAP_se = 'Current Gap Error'
+)
+
+# calculates totals with errors. Gap totals are with a floor of zero. 
+generate_subtitle = function(data, x) {
+  total = data[[x]] %>% 
+    multiply_by(cellsize) %>% 
+    global(fun='sum', na.rm=T) %>% 
+    divide_by(1e6) %>% 
+    round(1) 
+  
+  error = paste0(x, '_se') %>% 
+    data[[.]] %>% 
+    {.^2} %>% 
+    multiply_by(cellsize) %>% 
+    global(fun='mean', na.rm=TRUE) %>% 
+    sqrt %>% 
+    multiply_by(suit_area) %>% 
+    divide_by(1e6) %>% 
+    round(1)
+  
+  if (grepl('se', x)) {
+    out = NULL
+  } else {
+    out = paste(total, '±', error, 'Tg C')
+  }
+  return(out)
+}
+
+terra_max = function(x) x@ptr$range_max
+terra_min = function(x) x@ptr$range_min
+
+calc_fill = function(x) {
+  mx = max(x) %>% 
+    ceiling
+  mn = min(x) %>% 
+    floor
+  dif = mx - mn
+  if (dif < 5) {
+    out = seq(mn, mx, by=1)
+  } else if (dif < 10) {
+    out = seq(mn, mx, by=2)
+  } else if (dif < 50) {
+    out = seq(10*floor(mn/10), 10*ceiling(mx/10), by=10)
+  } else if (dif < 80) {
+    out = seq(10*floor(mn/10), 10*ceiling(mx/10), by=15)
+  } else if (dif < 100) {
+    out = seq(10*floor(mn/10), 10*ceiling(mx/10), by=20)
+  } else if (dif < 500) {
+    out = seq(100*floor(mn/100), 100*ceiling(mx/100), by=100)
+  }
+  return(out)
+}
+
+mx_stock = max(
+  terra_max(pltdf$CSTOCK_80), 
+  terra_max(pltdf$CSTOCK_NOW))
+mn_stock = min(
+  terra_min(pltdf$CSTOCK_80),
+  terra_min(pltdf$CSTOCK_NOW)
+)
+
+fill_limits = rbind(
+  CSTOCK_NOW = c(mn_stock, mx_stock),
+  CSTOCK_80 = c(mn_stock, mx_stock),
+  CGAP = c(0, ceiling(terra_max(pltdf$CGAP))),
+  CSTOCK_NOW_se = c(0, ceiling(terra_max(data$CSTOCK_NOW_se))),
+  CSTOCK_80_se = c(0, ceiling(terra_max(data$CSTOCK_NOW_se))),
+  CGAP_se = c(0, ceiling(terra_max(data$CSTOCK_NOW_se)))
+)
+calc_fill = function(x) {
+  mx = max(x)
+  if (mx < 5) {
+    out = seq(0, ceiling(mx), by=1)
+  } else if (mx < 10) {
+    out = seq(0, ceiling(mx), by=2)
+  } else if (mx < 25) {
+    out = seq(0, 10*ceiling(mx/10), by=5)
+  } else if (mx < 50) {
+    out = seq(0, 10*ceiling(mx/10), by=10)
+  } else if (mx < 200) {
+    out = seq(0, 10*ceiling(mx/10), by=30)
+  } else if (mx < 500) {
+    out = seq(0, 100*ceiling(mx/100), by=100)
+  }
+  return(out)
+}
+
+# this is a pretty slow function
+subtitles = lapply(nn, function(x) generate_subtitle(data, x)) %>% 
+  set_names(nn)
+subtitles
+```
+
+## Plot
+```{r fig.height=8}
+fig4 = lapply(nn, function(x) {
+  out = ggplot(mwi_utm) +
+    # political boundaries as background
+    scale_x_continuous(breaks=seq(33, 36, by=1)) +
+    geom_sf(color='darkgray',
+            fill='darkgray') +
+    
+    # stock level
+    # new_scale('fill') +
+    geom_stars(data=st_as_stars(pltdf[[x]])) +
+    scale_fill_distiller(palette='YlGnBu',
+                         direction=1,
+                         na.value=NA,
+                         limits=fill_limits[x,],
+                         breaks=calc_fill(fill_limits[x,])) +
+  
+    # political boundaries
+    geom_sf(color='white',
+            fill=NA,
+            size=0.3) +
+    labs(title=prettynames[x],
+         subtitle=subtitles[[x]],
+         fill=expression(paste('Mg C ha'^{-1})))
+
+  out = gg_mapthemer(out)+
+    theme(legend.position=c(0.85, 0.7),
+          axis.title=element_blank(),
+          axis.text=element_text(size=8),
+          legend.text=element_text(size=8),
+          legend.title=element_text(size=8),
+          plot.title=element_text(size=10),
+          plot.subtitle=element_text(size=9),
+          legend.key.width=unit(0.2, 'in'),
+          legend.key.height=unit(0.15, 'in')
+          )
+  
+  return(out)
+})
+```
+
+```{r fig.height=5, fig.width=6.5}
+grid.arrange(grobs=fig4, nrow=1)
+```
+
+## Export
+```{r}
+here(out_dir, 'Figure 4 - Maps of Stocks.jpg') %>% 
+  jpeg(height=5, width=6.5, units='in', res=300)
+grid.arrange(grobs=fig4, nrow=1)
+dev.off()
+```
+
+
+# Figure S3 - Errors of Current Stocks
+```{r fig.height=8}
+pltdf_se = out_stocks[[is_se]] %>% 
+  aggregate(fact=10) %>% 
+  project(set_projection)
+
+nn = names(pltdf_se)
+```
+
+## Plot
+```{r}
+fig4err = lapply(nn, function(x) {
+  out = ggplot(mwi_utm) +
+    # political boundaries as background
+    scale_x_continuous(breaks=seq(33, 36, by=1)) +
+    geom_sf(color='darkgray',
+            fill='darkgray') +
+    
+    # stock level
+    # new_scale('fill') +
+    geom_stars(data=st_as_stars(pltdf_se[[x]])) +
+    scale_fill_distiller(palette='Reds',
+                         direction=1,
+                         na.value=NA,
+                         breaks=seq(0, 20, by=2)) +
+  
+    # political boundaries
+    geom_sf(color='white',
+            fill=NA,
+            size=0.3) +
+    labs(title=prettynames[x],
+         fill=expression(paste("Mg C ha"^{-1}))) 
+
+  out = gg_mapthemer(out)+
+    theme(legend.position=c(0.85, 0.7),
+          axis.title=element_blank(),
+          axis.text=element_text(size=8),
+          legend.text=element_text(size=8),
+          legend.title=element_text(size=8),
+          plot.title=element_text(size=10),
+          plot.subtitle=element_text(size=9),
+          legend.key.width=unit(0.2, 'in'),
+          legend.key.height=unit(0.15, 'in')
+          )
+  
+  return(out)
+})
+```
+
+```{r fig.height=5, fig.width=6.5}
+grid.arrange(grobs=fig4err, nrow=1)
+```
+
+## Export
+```{r}
+here(out_dir, 'Figure S3 - Errors of Maps of Stocks.jpg') %>% 
+  jpeg(height=5, width=6.5, units='in', res=300)
+grid.arrange(grobs=fig4err, nrow=1)
+dev.off()
+```
+
+# Figure S4 - iSDA Stocks
+## Predict
+### Derive qr equation 
+Using sampling points. Predicting unadjusted iSDA stock potentials
+from iSDA soil properties (previously, used soil properties to predict adjusted
+isda stock potentials)
+```{r}
+C_form = potential_stocks[['top_stat']]$formula %>% 
+  as.character %>% 
+  .[3] %>% 
+  paste('ISDA_CSTOCK_NOW', ., sep='~') %>% 
+  formula
+
+quantiles = c(0.8)
+qr_mod = rq(C_form, data=pt, tau=quantiles, ci=TRUE)
+summary(qr_mod)
+```
+### Predict
+```{r}
+pred = 'ISDA_CSTOCK_80'
+model = qr_mod
+
+# predict
+new_layers = predict(isda, 
+                     model,
+                     fun=rast_predict_se)
+
+names(new_layers) = c(
+  pred,
+  paste0(pred, '_se')
+)
+
+# Set floor
+tt = 
+  max(new_layers[[pred]], 
+      isda[['ISDA_CSTOCK_NOW']])
+names(tt) = pred
+
+
+terra::add(isda) = tt
+terra::add(isda) = new_layers[[2]]
+```
+
+```{r}
+isda$ISDA_CGAP = isda$ISDA_CSTOCK_80 - isda$ISDA_CSTOCK_NOW
+```
+
+## Map
+### stocks and gaps layers
+```{r fig.height=8}
+is_stock = (grepl('CSTOCK', names(isda)) | grepl('CGAP', names(isda))) & !(grepl('_se', names(isda)))
+isda_stocks = isda[[is_stock]]
+```
+
+
+### Plotting parameters
+```{r fig.height=8}
+isda_utm = aggregate(isda_stocks, fact=10) %>% 
+  project(set_projection)
+nn = names(isda_utm)
+
+prettynames = c(
+  ISDA_CSTOCK_NOW = 'iSDA Current Stock',# [Mg C/ha]',
+  ISDA_CSTOCK_80 = 'iSDA Potential Stock',
+  ISDA_CGAP = 'iSDA Current Gap'
+)
+
+
+generate_subtitle = function(data, x) {
+  total = data[[x]] %>% 
+    multiply_by(cellsize) %>% 
+    global(fun='sum', na.rm=T) %>% 
+    divide_by(1e6) %>% 
+    round(1) 
+    out = paste(total, 'Tg C')
+  return(out)
+}
+
+#Skip setting fill limits to keep same as the adjsutment
+isda_fill_limits = fill_limits
+rownames(isda_fill_limits) %<>% paste('ISDA', ., sep='_')
+# fill_limits = rbind(
+#   ISDA_CSTOCK_NOW = c(mn_stock, mx_stock),
+#   ISDA_CSTOCK_80 = c(mn_stock, mx_stock),
+#   ISDA_CGAP = c(0, ceiling(terra_max(stocks_utm$CGAP)))
+# )
+isda_subtitles = lapply(nn, function(x) generate_subtitle(isda_stocks, x)) %>% 
+  set_names(nn)
+isda_subtitles
+```
+
+### Plot
+```{r fig.height=8}
+figS4 = lapply(nn, function(x) {
+  out = ggplot(mwi_utm) +
+    # political boundaries as background
+    scale_x_continuous(breaks=seq(33, 36, by=1)) +
+    geom_sf(color='darkgray',
+            fill='darkgray') +
+    
+    # stock level
+    # new_scale('fill') +
+    geom_stars(data=st_as_stars(isda_utm[[x]])) +
+    scale_fill_distiller(palette='YlGnBu',
+                         direction=1,
+                         na.value=NA,
+                         limits=isda_fill_limits[x,],
+                         breaks=calc_fill(isda_fill_limits[x,])) +
+  
+    # political boundaries
+    geom_sf(color='white',
+            fill=NA,
+            size=0.3) +
+    labs(title=prettynames[x],
+         subtitle=isda_subtitles[[x]],
+         fill=expression(paste('Mg C ha'^{-1})))
+
+  out = gg_mapthemer(out)+
+    theme(legend.position=c(0.85, 0.7),
+          axis.title=element_blank(),
+          axis.text=element_text(size=8),
+          legend.text=element_text(size=8),
+          legend.title=element_text(size=8),
+          plot.title=element_text(size=10),
+          plot.subtitle=element_text(size=9),
+          legend.key.width=unit(0.2, 'in'),
+          legend.key.height=unit(0.15, 'in')
+          )
+  
+  return(out)
+})
+
+```
+
+```{r fig.height=5, fig.width=6.5}
+grid.arrange(grobs=figS4, nrow=1)
+```
+
+### Export
+```{r}
+here(out_dir, 'Figure S4 - iSDA Stocks.jpg') %>% 
+  jpeg(height=5, width=6.5, units='in', res=300)
+grid.arrange(grobs=figS4, nrow=1)
+dev.off()
+```
+
+# Fig S5 - Differences with predicted
+## Calculate
+```{r}
+diff = out_stocks$CSTOCK_NOW - isda_stocks$ISDA_CSTOCK_NOW
+diff$CSTOCK_80 = out_stocks$CSTOCK_80 - isda_stocks$ISDA_CSTOCK_80
+diff$CGAP = out_stocks$CGAP - isda_stocks$ISDA_CGAP
+```
+
+## Map
+
+```{r}
+pltdf = aggregate(diff, fact=10) %>% 
+  project(set_projection)
+
+nn = names(pltdf)
+
+prettynames = c(
+  CSTOCK_NOW = 'Adjustment in Current Stock',# [Mg C/ha]',
+  CSTOCK_80 = 'Adjustment in Potential Stock',
+  CGAP = 'Adjustment in Current Gap'
+)
+
+mx_stock = max(
+  terra_max(pltdf$CSTOCK_80), 
+  terra_max(pltdf$CSTOCK_NOW))
+mn_stock = min(
+  terra_min(pltdf$CSTOCK_80),
+  terra_min(pltdf$CSTOCK_NOW)
+)
+
+generate_subtitle = function(data, x) {
+  total = data[[x]] %>% 
+    multiply_by(cellsize) %>% 
+    global(fun='sum', na.rm=T) %>% 
+    divide_by(1e6) %>% 
+    round(1) 
+  
+    out = paste(total, 'Tg C')
+  # }
+  return(out)
+}
+
+diff_fill_limits = rbind(
+  CSTOCK_NOW = c(mn_stock, mx_stock),
+  CSTOCK_80 = c(mn_stock, mx_stock),
+  CGAP = c(floor(terra_min(diff$CGAP)), ceiling(terra_max(diff$CGAP)))
+)
+
+diff_subtitles = lapply(nn, function(x) generate_subtitle(diff, x)) %>% 
+  set_names(nn)
+diff_subtitles
+```
+
+
+```{r}
+figS5 = lapply(nn, function(x) {
+  out = ggplot(mwi_utm) +
+    # political boundaries as background
+    scale_x_continuous(breaks=seq(33, 36, by=1)) +
+    geom_sf(color='darkgray',
+            fill='darkgray') +
+    
+    # stock level
+    # new_scale('fill') +
+    geom_stars(data=st_as_stars(pltdf[[x]])) +
+    scale_fill_distiller(palette='Reds',
+                         direction=1,
+                         na.value=NA,
+                         limits=diff_fill_limits[x,],
+                         breaks=calc_fill(diff_fill_limits[x,])) +
+  
+    # political boundaries
+    geom_sf(color='white',
+            fill=NA,
+            size=0.3) +
+    labs(title=prettynames[x],
+         subtitle=diff_subtitles[[x]],
+         fill=expression(paste('Mg C ha'^{-1})))
+
+  out = gg_mapthemer(out)+
+    theme(legend.position=c(0.85, 0.7),
+          axis.title=element_blank(),
+          axis.text=element_text(size=8),
+          legend.text=element_text(size=8),
+          legend.title=element_text(size=8),
+          plot.title=element_text(size=10),
+          plot.subtitle=element_text(size=9),
+          legend.key.width=unit(0.2, 'in'),
+          legend.key.height=unit(0.15, 'in')
+          )
+  
+  return(out)
+})
+```
+
+```{r fig.height=5, fig.width=6.5}
+grid.arrange(grobs=figS5, nrow=1)
+```
+
+```{r}
+here(out_dir, "Figure 5 - Difference in Stocks.jpg") %>% 
+  jpeg(width=6.5, height=5, units='in', res=300)
+grid.arrange(grobs=figS5, nrow=1)
+dev.off()
+```
+

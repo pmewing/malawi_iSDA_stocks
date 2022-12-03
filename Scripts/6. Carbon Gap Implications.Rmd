@@ -1,0 +1,315 @@
+---
+title: "5. Carbon Gap Implications"
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding=encoding, output_dir=here::here('Results'))})
+output:
+  html_document:
+    toc: true
+    toc_depth: 5
+    toc_float: true
+    df_print: paged
+    code_folding: hide
+author: PME
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Interpretations
+1. Time to saturation under 4 parts per mille improvement
+2. Sequestration potential of non-responsive sites
+
+# Load
+
+## Paths, Variables, Libraries
+
+Variables
+```{r}
+set_datum = 'epsg:4326'  # WGS84
+set_projection = 'epsg:32736'  # utm 36S.
+# output
+overwrite = FALSE
+# overwrite = TRUE
+
+plot_diagnostics = TRUE
+```
+
+Paths
+```{r}
+# locations
+in_dir = 'Data'
+in_pt = 'Master Points.gpkg'
+
+dir_spatial = 'Spatial' # in in_dir
+out_dir = 'Results'
+
+in_isda = 'ISDA_AR_MWI.tif'
+in_suit = 'LI_ETAL_2017_MW_AGRI_LAND_SUIT.tif'  # cropland suitability
+in_mwi = "Malawi gadm36_MWI.gpkg"
+in_stocks = 'corrected_SOC_stocks_mwi.tif'
+# in_dem = "SRTM90_V4_MWI.tif"  # from Google Earth Engine via ree
+
+```
+
+Libraries
+```{r}
+libs = c(
+  # Coding helpers
+  'here', 
+  # 'tidyr',
+  'magrittr',
+  
+  # spatial stuff
+  'sf',
+  'terra',
+  'stars',
+  
+  # Other modeling
+  'glmnet',
+  # 'quantreg',
+  
+  # plotting
+  'ggplot2',
+  'rasterVis'
+  # 'gridExtra'
+)
+```
+
+```{r message=FALSE}
+for (i in libs) {
+  if (!require(i, character.only=TRUE)) {
+    renv::install(i)
+    require(i, character.only=TRUE)
+}}
+
+resource = function() {
+  ll = here('Scripts', 'V3 Functions') %>% 
+  list.files(full.names=TRUE)
+  for (i in ll) {
+    source(i)
+  }
+}
+resource()
+```
+
+Versions
+```{r}
+sapply(libs, function(x) as.character(packageVersion(x))) %>% 
+  as.matrix %>% 
+  set_colnames(R.version.string)
+```
+
+## More functions
+```{r}
+gg_mapthemer = function(x, 
+                        xlab=NULL, 
+                        ylab=NULL,
+                        coord_equal=FALSE) {
+  out = x +
+    labs(x=xlab,
+         y=ylab) +
+    theme_minimal() +
+    theme(axis.text.x=element_text(angle=90, 
+                                   hjust=1, 
+                                   vjust=0.5))
+  if (coord_equal) {
+    out = out + coord_equal()
+  }
+  return(out)
+}
+
+ggmap = function(raster, fill='value', label=NULL) {
+  require(rasterVis)
+  out = gplot(raster) +
+    geom_tile(aes_string(fill=fill)) +
+    scale_fill_distiller(palette='YlGnBu', 
+                        direction=1, 
+                        na.value=NA) +
+    coord_equal() +
+    labs(fill=label)
+  out = gg_mapthemer(out)
+  return(out)
+}
+```
+
+## Load
+```{r}
+load(here(in_dir, 'Fig 2 - Field Estimates.Rdata'))
+load(here(in_dir, 'Part 3 - iSDA Corrections.Rdata'))
+```
+
+### Corrected stocks
+```{r}
+stocks = here(out_dir, in_stocks) %>%
+  rast
+ggmap(stocks$CSTOCK_NOW) +
+  labs(title='Current Stocks [Mg/ha]')
+```
+
+### iSDA
+load and convert units
+```{r fig.height=4, fig.width=8}
+isda = here(in_dir, dir_spatial, in_isda) %>% 
+  rast %>% 
+  mask(stocks$CSTOCK_NOW)
+ggmap(isda$ISDA_SOC) +
+  labs(title='iSDA SOC [g/kg]')
+```
+
+# Headline Values
+## Sampled Fields
+Average gap increase from adjusting iSDA on sampled fields
+```{r}
+c_to_co2e = function(x) x*44.01/12.011
+co2e_to_dollar = function(x) c_to_co2e(x)*85 
+get_totals = function(x) {
+  c(
+    carbon = x,
+    co2 = c_to_co2e(x),
+    dollars = co2e_to_dollar(x)
+  )
+}
+
+avg_gap_increase = with(pt, CGAP - ISDA_CGAP) %>% 
+  mean(na.rm=T)
+get_totals(avg_gap_increase)
+```
+
+## Total dollar value
+of sequestration
+```{r}
+map_total = function(x) {
+  {x * cellSize(x, unit='ha')} %>% 
+    global(fun='sum', na.rm=TRUE)
+}
+total_gap = map_total(stocks$CGAP)
+
+get_totals(total_gap)
+```
+
+# Amounts across time
+## First year sequestration potential
+```{r}
+rate = 0.004
+total_emissions = 19.2*1e6 # in Mg (reported in Mt)
+
+calc_seq_years = function(current, potential, rate, years) {
+  out =
+    {current * (1+rate)^years} %>% 
+    min(potential)  %>% 
+    {. - current}
+}
+
+
+timeseq_1 = calc_seq_years(stocks$CSTOCK_NOW, stocks$CSTOCK_80, rate, 1)
+
+ggmap(timeseq_1, label='Carbon\n[Mg/ha]') +
+  labs(title='C sequestered in first year')
+```
+
+```{r}
+total_timeseq_1 = map_total(timeseq_1)
+total_timeseq_1 %>% 
+  get_totals
+```
+units are Mg
+
+```{r}
+c_to_co2e(total_timeseq_1)/total_emissions
+```
+
+## 50% of fields reach saturation
+```{r}
+calc_time_saturation = function(now, goal, rate) {
+  out = log(goal/now, base=1+rate)
+}
+
+time_sat = calc_time_saturation(stocks$CSTOCK_NOW,
+                                stocks$CSTOCK_80,
+                                rate)
+med_years = global(time_sat[[1]],
+                   fun=median,
+                   na.rm=T) %>% 
+  ceiling
+ggmap(time_sat, label='Years') +
+  labs(title='Time to Saturation',
+       subtitle=paste('Median:', med_years, 'years'))
+```
+
+```{r}
+timeseq_med = calc_seq_years(stocks$CSTOCK_NOW, stocks$CSTOCK_80, rate, unlist(med_years))
+
+ggmap(timeseq_med, label='Carbon\n[Mg/ha]') +
+  labs(title='C sequestered by 50% saturation')
+```
+
+How much carbon is this?
+```{r}
+seq_median_sat = map_total(timeseq_med) %>% 
+  unlist %>% 
+  get_totals %T>%
+  print
+```
+
+
+
+# Non responsive sites sequestration potential
+Burke et al identified a threshold of 9.4 g carbon/kg soil for fertilizer responsiveness.
+
+First find sites below that threshold. This requires updating iSDA carbon 
+concentration using the relationship found with the bottom-up adjustment.
+
+Then calculate time to the threshold. 
+```{r}
+thresh = .0094  #g C/kg soil
+rate = 0.004 # percent increase per year
+
+# correct iSDA SOC
+correct_SOC = predict(isda,
+                      current_stocks$`bottom totalc`,
+                      type='response')
+
+# identify pixels sites that are above the threshold
+is_nonresponsive = correct_SOC <= thresh
+is_nonresponsive[!is_nonresponsive] = NA
+
+# Mask responsive pixels and calculate time to responsiveness
+time_to_responsive = mask(correct_SOC, is_nonresponsive) %>% 
+  calc_time_saturation(thresh, rate)
+```
+
+
+```{r}
+ggmap(time_to_responsive, label='Years') +
+  labs(title='Time to Responsiveness',
+       subtitle=paste0(rate*100, '% annual increase'))
+```
+## Median time to responsiveness
+```{r}
+tt = spatSample(time_to_responsive, 1000, as.points=FALSE, na.rm=TRUE)
+lattice::densityplot(~lyr.1, data=tt, main=paste("Median =", median(tt$lyr.1)))
+```
+
+## C sequestration to responsiveness
+```{r}
+cseq_to_responsive =
+  mask(stocks$CSTOCK_NOW, 
+       is_nonresponsive) %>% 
+  calc_seq_years(stocks$CSTOCK_80, rate, time_to_responsive)
+
+
+ggmap(cseq_to_responsive, label='SOC [Mg/ha]')
+
+```
+
+```{r}
+total_cseq_to_responsive = map_total(cseq_to_responsive) %>% 
+  get_totals %>% 
+  print
+```
+```{r}
+total_cseq_to_responsive %>% 
+  sapply('/', 1e6)
+```
+Units are: Pg C, Mt CO2e, million USD 

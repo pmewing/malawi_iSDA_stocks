@@ -1,0 +1,806 @@
+---
+title: "Fig 2 - Importance of Field Estimates of Carbon Stocks"
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding=encoding, output_dir=here::here('Results'))})
+output:
+  html_document:
+    toc: true
+    toc_depth: 5
+    toc_float: true
+    df_print: paged
+    code_folding: hide
+author: PME
+---
+
+# Overview
+How much carbon is stored in agricultural soils in sub-Saharan Africa? How much 
+could be there? Where are these stocks and "gaps"? What is the value of continuing
+to collect data to answer these questions at the field and local scales when 
+public databases are increasingly available and purportedly accurate?
+
+This notebook will begin to answer these questions for the 0-20cm depth in Malawi. Underlying data was collected
+as part of the AfricaRISING project ca 2016, with additional data collected by 
+Regis Chikowo and associates in the fall of 2020. This data will be used in conjunction
+with publicly available soils data, the recently-released iSDA 30m dataset 
+([Hengl *et al.*, 2021](https://www.nature.com/articles/s41598-021-85639-y)). 
+Agricultural soil will be identified and categorized using the agricultural 
+potential estimates of [Li *et al.* (2019)]
+(https://onlinelibrary.wiley.com/doi/full/10.1002/ldr.2723).
+
+Estimation of carbon stocks requires the depth of sample, concentration of carbon 
+in soil, and bulk density of soil. Both actual stocks and potential stocks vary
+with texture, management, climate, and additional factors - in particular, both coarse
+and agriculturally managed soils tend to have lower carbon than finer and unmanaged 
+soils ([Castellano *et al.*, 2015](https://onlinelibrary.wiley.com/doi/full/10.1111/gcb.15782)). 
+We have collected data on soil carbon concentrations and other properties including texture 
+for 0-20cm depth across ~1200 sites in southern and central Malawi. We collected bulk density
+data on a subset of these sites. 
+
+THe iSDA dataset represents the current state-of-the-art in predictions of soil properties across
+SSA. In theory, it can be used to predict both carbon stocks and carbon storage potential - but only
+if the predictions are representative of the truth. 
+
+**We hypothesize** that:
+
+1. Locally collected data remains essential for quantifying stocks and storage
+potential at local to regional scales.
+2. This local groundtruthing can be used to improve iSDA estimates of carbon stocks
+and storage potential at unmeasured sites within the region.
+
+If validated, then continued local data collection should improve estimates of regional stocks, and 
+enable more reliable identification of fields with high storage potential. 
+
+## This notebook
+We address Hypothsis 1 in this notebook. Data are field data and iSDA data extracted
+for field locations. The workflow for field data is:
+
+1. Derive a pedotransfer function to predict bulk density at sites where it was not
+measured (this is Xinyi's work).
+2. Identify soil properties that can be used to predict storage potential, defined as the 80th 
+quantile of similar soils.
+3. Uses these relationships to calculate carbon stocks, storage potential, and gaps
+at each measured location.
+4. Compare these carbon parameters to those predicted by iSDA.
+
+All predictions will be from cross validation at the extension planning area (EPA) level.
+
+# Load
+## Paths, Variables, Libraries
+Variables
+```{r}
+set_datum = 'epsg:4326'  # WGS84
+set_projection = 'epsg:32736'  # utm 36S.
+# output
+overwrite = FALSE
+# overwrite = TRUE
+
+covars = c('ELEVATION', 'NDVI', 'EVI', 'SR', 'LST', 'PRECIP_DAILY', 'SLOPE')
+```
+
+Paths
+```{r}
+# locations
+in_dir = 'Data'
+in_pt = 'Master Points.gpkg'
+
+dir_spatial = 'Spatial' # in in_dir
+# in_isda = 'ISDA_AR_MWI.tif'
+# in_suit = 'LI_ETAL_2017_MW_AGRI_LAND_SUIT.tif'  # cropland suitability
+
+```
+
+Libraries
+```{r}
+libs = c(
+  # Coding helpers
+  'here', 
+  'tidyr',
+  'magrittr',
+  
+  # spatial stuff
+  'ape',
+  'sf',
+  
+  # Other modeling
+  'glmnet',
+  'quantreg',
+  'car',
+  'boot',
+  
+  # plotting
+  'ggplot2',
+  'gridExtra',
+  'ggpmisc'
+)
+```
+
+```{r message=FALSE}
+for (i in libs) {
+  if (!require(i, character.only=TRUE)) {
+    renv::install(i)
+    require(i, character.only=TRUE)
+}}
+
+resource = function() {
+  ll = here('Scripts', 'V3 Functions') %>% 
+  list.files(full.names=TRUE)
+  for (i in ll) {
+    source(i)
+  }
+}
+resource()
+
+```
+
+Versions
+```{r}
+sapply(libs, function(x) as.character(packageVersion(x))) %>% 
+  as.matrix %>% 
+  set_colnames(R.version.string)
+```
+
+
+
+## Load
+```{r cache=TRUE}
+pt = here(in_dir, in_pt) %>% 
+  st_read
+```
+## Gently munge 
+
+- Extract suitability data to point data
+- Resample suitability to match isda (nearest neighbor for categorical)
+- Mask land that is outside of malawi or not suitable for agriculture (cat 5)
+- Make a dataframe of covariates
+```{r cache=TRUE, warning=FALSE}
+rownames(pt) = pt$SAMPLEID
+```
+
+Remove the unreasonably low value for sand. Basically no soil has 0% sand. Sand is an important soil property here; it's weird value
+throws off all other textural values. 
+```{r}
+p1 = ggplot(pt, 
+            aes(x=SAND)) +
+  scale_x_continuous(limits=c(0, 1)) +
+  geom_density() +
+  geom_point(aes(y=0,
+                 color={SAND < 0.1 | is.na(SAND)})) + 
+  scale_color_manual(values=c('black', 'tomato3')) +
+  labs(x='Sand [%]',
+       y='Density',
+       color='Outlier')
+gg_themer(p1, theme_color=FALSE)
+```
+
+
+```{r}
+pt[which.min(pt$SAND), 'SAND'] = NA
+
+```
+
+## Colors
+```{r}
+dist_epa = pt %>% 
+  as.data.frame %>% 
+  .[, c('DISTRICT', 'EPA')] %>% 
+  apply(1, paste, collapse='_') %>% 
+  unique %>% 
+  sort
+
+epa_levels = strsplit(dist_epa, '_') %>% 
+  sapply('[', 2)
+
+epa_colors = c('darkorange1', 'darkorange3', 'darkorange4',       #Dedza
+           'mediumpurple1', 'mediumpurple3', 'mediumpurple4', #Machinga
+           'seagreen1', 'seagreen3') %>%             #Ntcheu
+  set_names(epa_levels)
+
+cbind(dist_epa, epa_colors)
+
+pt$EPA %<>% factor(levels=epa_levels)
+```
+
+Here are the sample locations:
+
+```{r}
+ggplot(st_transform(pt, set_projection),
+       aes(color=EPA)) +
+  scale_color_manual(values=epa_colors) +
+  geom_sf() +
+  theme_minimal()
+```
+
+
+
+# Bulk Density Pedotransfer Function
+Calculating carbon stocks requires:
+
+1. carbon concentration
+2. bulk density
+3. depth
+
+We need a pedotransfer function to estimate bulk density at unknown locations.
+
+We'll use a lasso to find parameters that predict bulk density from those we have available:
+sand, silt, clay, total carbon, elevation, precipitation, and slope. 
+
+The breakdown of sampled fields across the region is:
+```{r}
+tapply(pt$BULK_DENSITY, pt$EPA, function(x) sum(!is.na(x))) %>% 
+  c(., TOTAL=sum(.))
+```
+Values in this table are averages of 6 samples per field, 3 taken in the row and 3 taken in the interrow. Most fields are corn this year, and all include corn as part of the rotation.
+
+```{r}
+plt = 
+  qplot(BULK_DENSITY, 
+        data=pt, 
+        geom='density', 
+        ylab='Density') + 
+    geom_rug(aes(color=EPA))
+gg_themer(plt, theme_color=epa_colors[pt$EPA %>% levels])
+```
+
+
+## Identify parameters
+Using a relaxed lasso. Parameters are identified using 10-fold cross validation.
+```{r}
+x = c('SAND', 'SILT', 'CLAY', 'TOTALC', 'ELEVATION', 'SLOPE', 'PRECIP_DAILY')
+y = 'BULK_DENSITY'
+transform = 'identity'
+
+bd_lasso = paste(x, collapse='+') %>% 
+  paste(y, ., sep='~') %>% 
+  formula %>% 
+  run_glmnet(data=pt,        # wrapper that uses model.frame and model.matrix to make x and y matrices for glmnet.
+             link=transform, # of gaussian model
+             alpha=0.95)
+```
+
+Two parameters it is. And they are:
+
+```{r}
+coef(bd_lasso$cv_mod, s='lambda.1se')
+```
+## Evaluate
+for whether we're using an appropriate model
+```{r fig.height=6, fig.width=6}
+pedotransfer = glm_from_glmnet(pt, bd_lasso, y=y, link=transform)
+```
+Looks OK.
+
+```{r}
+Anova(pedotransfer, test.statistic='F')
+```
+
+```{r}
+plot_glm(pedotransfer, pt, colors=pt[, 'EPA'], palette=epa_colors)
+```
+This model has adequate predictive power, although the residuals are very spatially 
+correlated (idw weighting of great circle distance). This could be due to a number 
+of factors, including spatially correlated management (which affects bulk density). 
+RMSE is expected to be maybe 6%, which is pretty good. 
+
+```{r}
+summary(pedotransfer)
+```
+
+
+### Cross-validate
+We will cross validate with EPA using k-fold cross validation. A leave-EPA-out approach would
+be more robust if enough data had been collected, as it would more 
+closely simulate the expected performance of sampling a new EPA than fully 
+random cross validation. 
+```{r}
+cv_grp = generate_cv_groups(pt[!is.na(pt$BULK_DENSITY), ], 'EPA')
+pedotransfer_CV = cv_glm(pedotransfer, groups=NULL)
+```
+
+Indices are:
+1. Root mean squared error of prediction
+2. Relative prediction error
+3. Coefficient of determination.
+
+```{r}
+RMSPE = function(obs, pred) {
+  err = pred - obs
+  out = sqrt(mean(err^2, na.rm=TRUE))
+  return(out)
+}
+
+RPE = function(obs, pred) {
+  rmspe = RMSPE(obs, pred)
+  exp_val = mean(obs, na.rm=TRUE)
+  out = rmspe/exp_val
+  return(out)
+}
+
+co_det = function(obs, pred) {
+  SSR = sum((obs-pred)^2, na.rm=TRUE)
+  SST = sum((obs-mean(obs, na.rm=TRUE))^2, na.rm=TRUE)
+  out = 1-(SSR/SST)
+  # out = cor(obs, pred)^2
+  return(out)
+}
+
+pred = pedotransfer_CV[, 'cv_fit']
+obs = data.frame(pt)[rownames(pedotransfer_CV), 'BULK_DENSITY']
+
+pedotransfer_fit = c(
+  RMSPE = RMSPE(obs, pred),
+  RPE = RPE(obs, pred),
+  R2 = co_det(obs, pred)
+) %>% 
+  round(3) %T>%
+  print
+
+```
+
+# Calculate stock now
+To allow use of logistic regression, which bounds the output within [0,1] for compositional
+coherence. Also does a nice job normalizing the data. 
+
+```{r}
+pt$BD_NOW = predict(pedotransfer, pt)
+pt$CSTOCK_NOW = with(pt, 
+                     calc_stock(TOTALC/1000, 
+                                BD_NOW, 
+                                0.2))
+# is_carbon = c('ISDA_TC', 'ISDA_SOC', 'TOTALC')
+# pt[, is_carbon] %<>% lapply('/', 1000)
+```
+
+
+# Storage Potential
+Carbon concentrations when acting as a response variable will be transformed 
+using a logit function of decimal fractions. This respects the compositional 
+nature of carbon concentrations and reduces skewness:
+```{r}
+gg_themer(
+  qplot(CSTOCK_NOW,
+        data=pt,
+        geom='density',
+        ylab='Density') +
+    geom_rug(alpha=0.2)
+)
+```
+
+```{r}
+x = c('SAND', 'SILT', 'CLAY', 'ELEVATION', 'PRECIP_DAILY', 'LST')
+y = 'CSTOCK_NOW'
+transform = 'identity'
+
+totalc_lasso = paste(x, collapse='+') %>% 
+  paste(y, ., sep='~') %>% 
+  formula %>% 
+  run_glmnet(data=pt,        # wrapper that uses model.frame and model.matrix to make x and y matrices for glmnet.
+             link=transform, # of gaussian model
+             alpha=1)
+```
+
+```{r}
+coef(totalc_lasso$cv_mod, s='lambda.1se')
+```
+
+### Evaluate briefly
+For whether we're using an appropriate model
+```{r fig.height=6, fig.width=6}
+totalc_pred = glm_from_glmnet(pt, totalc_lasso, y=y, link=transform)
+```
+Not great, but probably fine to get predictors. The logit link actually does fix the issues well when pre-transforming (rather than within glmnet).
+
+```{r}
+Anova(totalc_pred, test.statistic='F')
+```
+
+```{r}
+plot_glm(totalc_pred, pt, colors=pt[, 'EPA'])
+```
+Overall, the model looks fine for variable selection. 
+
+```{r}
+totalc_predictors = totalc_lasso$cv_mod %>% 
+  glmnet_predictors
+```
+
+## Estimate potentials
+### Model
+To estimate, we'll use quantile regression 
+```{r}
+C_form = paste(totalc_predictors, collapse='+') %>% 
+  paste('CSTOCK_NOW ~', .) %>% 
+  formula
+
+quantiles = c(0.8)
+qr_mod = rq(C_form, data=pt, tau=quantiles)
+```
+
+
+#### Table S2 Coefficients
+Manually entered into Table S2 
+```{r}
+summary(qr_mod)
+```
+
+### Estimate potential stocks
+```{r}
+pt$CSTOCK_80 = predict(qr_mod, pt)
+```
+
+Plot
+```{r}
+plt = 
+  pt[, c('EPA', 'CSTOCK_NOW', 'CSTOCK_80')] %>% 
+  pivot_longer(cols=where('is.numeric')) %>% 
+  # pivot_longer(cols=colnames(emp_potentials)) %>% 
+  ggplot(aes(x=EPA,
+             y=value)) +
+  geom_violin(aes(fill=name),
+              draw_quantiles=quantiles,
+              show.legend=TRUE) +
+  labs(title = 'Potential Carbon Stocks',
+       y = 'Carbon Stock [Mg/ha]',
+       x = NULL)
+gg_themer(plt) +
+  theme(axis.text.x=element_text(angle=90, hjust=1, vjust=0.5))
+```
+
+# Calculate gap
+```{r}
+# pt$BD_NOW = predict(pedotransfer, pt)
+# 
+# pt$TOTALC_80 = predict(qr_mod, pt) %>% 
+#   ilogit
+# pt$BD_80 = data.frame(SAND = pt$SAND,
+#                        TOTALC = pt$TOTALC_80) %>% 
+#   predict(pedotransfer, .)
+# 
+# pt$CSTOCK_NOW = with(pt, 
+#                      calc_stock(TOTALC, # in g/g
+#                                 BD_NOW, # in g/cm3
+#                                 0.2))   # in cm
+# pt$CSTOCK_80 = with(pt, 
+#                     calc_stock(TOTALC_80, 
+#                                BD_80, 
+#                                0.2))
+
+pt$CGAP = with(pt, 
+               CSTOCK_80 - CSTOCK_NOW)
+```
+
+## Repeat for iSDA
+
+```{r}
+pt$ISDA_CSTOCK_NOW = with(pt,
+                          calc_stock(ISDA_SOC/1000,
+                                     ISDA_BD,
+                                     0.2))
+isda_pt = grepl('ISDA', names(pt)) %>% 
+  pt[, .] %>% 
+  cbind(ELEVATION=pt$ELEVATION)
+names(isda_pt) %<>% 
+  gsub('ISDA_', '', .) %>% 
+  gsub('SOC', 'TOTALC', .)
+
+isda_qr = rq(C_form, data=isda_pt, tau=quantiles)
+```
+
+```{r}
+summary(isda_qr)
+```
+
+
+```{r}
+pt$ISDA_CSTOCK_80 = predict(isda_qr, isda_pt) 
+pt$ISDA_CGAP = with(pt, 
+                    ISDA_CSTOCK_80 - pt$ISDA_CSTOCK_NOW)
+```
+
+
+# FIGURE 2
+Fig 2: 	
+
+1. violins of data at sites for a) Stocks, b) Potential, and c) Gaps, by district 
+(x axis; or country if with tanzania) and by estimate iSDA, empirical (colors)
+2. scatters of iSDA vs empirical for d) stocks; e) potential; f) gaps colors are 
+(district/EPA) (color/shade) as in the site map above. 
+
+## Fig 2a
+```{r fig.height=3.5, fig.width=7}
+se = function(x) sd(x)/sqrt(length(x))
+se_high = function(x) mean(x) + se(x)
+se_low = function(x) mean(x) - se(x)
+
+pltdf = c('CSTOCK_NOW', 'CSTOCK_80', 'CGAP') %>% 
+  sapply(grepl, names(pt)) %>% 
+  apply(1, any) %>% 
+  pt[, .] %>% 
+  cbind(pt['EPA'],
+        pt['DISTRICT'],
+        pt['SAMPLEID']) %>% 
+  data.frame
+pltdf[, grepl('geom', names(pltdf))] = NULL
+
+pltdf %<>% pivot_longer(cols=where(is.numeric))
+pltdf$EST = grepl('ISDA', pltdf$name) %>% 
+  sapply(ifelse, 'iSDA', 'Field')
+pltdf$name %<>% 
+  gsub('CSTOCK_NOW', 'Current', .) %>% 
+  gsub('CSTOCK_80', 'Potential', .) %>% 
+  gsub('CGAP', 'Gap', .) %>% 
+  gsub('ISDA_', '', .) %>% 
+  factor(levels=c('Current', 'Potential', 'Gap'))
+```
+
+
+```{r fig.height=3.5, fig.width=7}
+width = 0.6
+fig2a =
+  ggplot(pltdf,
+       aes(x=EPA,
+           y=value,
+           fill=EST)) +
+  facet_wrap(~name, nrow=1, scales='free') +
+  stat_summary(geom='col',
+               fun='mean',
+               position='dodge',
+               width=width) +
+  stat_summary(geom='errorbar',
+               fun='mean',
+               fun.min=se_low,
+               fun.max=se_high,
+               width=0,
+               position=position_dodge(width=width)) +
+  labs(x=NULL,
+       y='Stock [Mg C/ha]',
+       fill=NULL,
+       tag='a)')
+
+
+fig2a %<>% 
+  gg_themer(theme_fill=c('#666666', '#BBBBBB'), theme_color=FALSE)
+fig2a = fig2a +
+  theme(axis.text.x=element_text(angle=90, hjust=1, vjust=0.3),
+        panel.grid.major.y=element_line(size=0.01, color='#EEEEEE'),
+        panel.grid.minor.y=element_line(size=0.01, color='#EEEEEE'),
+        # panel.ontop=TRUE,
+        #legend.position='bottom',
+        strip.text=element_text(hjust=0),
+        legend.text=element_text(color='#444444'))
+fig2a
+```
+
+### Fig 2a descriptive stats
+```{r}
+ff = 'value ~ EPA + DISTRICT + name + EST' %>% 
+  formula
+se = function(x) mean(x)/sqrt(length(x))
+tt = aggregate(ff, data=pltdf, FUN=mean) %>% 
+  data.frame(se=aggregate(ff, data=pltdf, FUN=se)[, 'value']) %>% 
+  .[order(.$name), ]
+tt
+```
+
+
+```{r}
+ff = 'value ~ name + EST' %>% 
+  formula
+tt = aggregate(ff, data=pltdf, FUN=mean) %>% 
+  data.frame(se=aggregate(ff, data=pltdf, FUN=se)[, 'value']) %>% 
+  .[order(.$name), ]
+tt
+```
+
+difference in current
+```{r}
+a = tt[tt[, 'name']=='Current' & tt[, 'EST']=='Field', c(3,4)]
+b = tt[tt[, 'name']=='Current' & tt[, 'EST']=='iSDA', c(3,4)]
+diff = a[1]-b[1]
+err = sqrt(a[2]^2 + b[2]^2)
+c(diff = diff,
+  err = err)
+```
+
+difference in gaps
+```{r}
+a = tt[tt[, 'name']=='Gap' & tt[, 'EST']=='Field', c(3,4)]
+b = tt[tt[, 'name']=='Gap' & tt[, 'EST']=='iSDA', c(3,4)]
+diff = a[1]-b[1]
+err = sqrt(a[2]^2 + b[2]^2)
+c(diff = diff,
+  err = err)
+```
+
+
+
+## Fig 2b
+```{r}
+pltdf2 = pltdf
+
+
+plt2_annotate = split(pltdf2, pltdf2$name) %>% 
+  sapply(function(x) {
+    x %<>%
+      .[, c('value', 'EST', 'SAMPLEID')] %>%
+      pivot_wider(id_cols='SAMPLEID',
+                  names_from='EST') %>%
+      na.omit
+    
+    out = co_det(x$Field, x$iSDA) %>% 
+      round(3)
+
+    return(out)
+  }) %>% 
+  # format for plotting
+  data.frame(name = names(.),
+             Rsq = .) %>%
+  set_rownames(NULL)
+plt2_annotate$name %<>% factor(levels(pltdf2$name))
+
+make_rsq = function(x) paste0("italic(R)^2 == ", x)
+plt2_annotate$Rsq %<>% make_rsq
+
+pltdf2  %<>%  
+  pivot_wider(names_from='EST',
+              values_from='value')
+
+xlim = range(pltdf2$Field, na.rm=T)
+ylim = range(pltdf2$iSDA, na.rm=T)
+
+lims = c(min(xlim[1], ylim[1]),
+         max(xlim[2], ylim[2]))
+```
+
+
+```{r}
+fig2d = 
+  ggplot(pltdf2,
+         aes(x=Field,
+                 y=iSDA)) +
+  coord_fixed(ylim=c(min(ylim), 100)) +
+  scale_x_continuous(breaks=c(-40, 0, 40, 80)) +
+  facet_wrap(~name) +
+  geom_hline(yintercept=0,
+             color='gray',
+             size=0.2) +
+  geom_vline(xintercept=0,
+             color='gray',
+             size=0.2) +
+  geom_point(aes(color=DISTRICT),
+             shape=3,
+             size=0.5, 
+             alpha=0.3) +
+  geom_abline(intercept=0,
+              slope=1,
+              linetype='dashed') +
+  geom_text(data=plt2_annotate,
+            aes(x=-25,
+                y=75,
+                label=Rsq),
+            inherit.aes=FALSE,
+            parse=TRUE,
+            size=2.5) +
+  labs(color=NULL,
+       x=expression(paste('Field [Mg C', ~ha^-1, ']', sep='')),
+       y=expression(paste('iSDA [Mg C', ~ha^-1, ']', sep='')),
+       tag='b)') + 
+  guides(color=guide_legend(override.aes=list(size=1.5, shape=15, alpha=1)))
+fig2d %<>% gg_themer(theme_color=c('tomato1', 'tomato3', 'tomato4'))
+fig2d = fig2d + 
+  theme(#legend.position='bottom',
+        axis.text.x=element_text(angle=90, hjust=1, vjust=0.5),
+        strip.text=element_text(hjust=0),
+        panel.grid.major=element_line(size=0.01, color='#EEEEEE'),
+        legend.key.size=unit(0.8, 'line'),
+        legend.text=element_text(color='#444444'))
+fig2d
+```
+
+## combine and export
+```{r fig.height=4, fig.width=6.5}
+grid.arrange(fig2a, fig2d)
+```
+
+```{r}
+here('Results', 'Fig 2 - Field Estimates.jpg') %>% 
+  jpeg(height=4, width=6.5, units='in', res=300)
+grid.arrange(fig2a, fig2d)
+dev.off()
+```
+
+
+# Figure 3
+```{r fig.height=2.5, fig.width=6.5}
+pltdf3 = pt[, c('CSTOCK_NOW', 'CSTOCK_80', 'SAND', 'SILT', 'ELEVATION')] %>% 
+  na.omit
+# pltdf[, c('SILT', 'CLAY')]
+pltdf3 %<>% 
+  pivot_longer(cols=c('SAND', 'SILT', 'ELEVATION'))
+pltdf3$IS_HIGH = pltdf3$CSTOCK_NOW >= pltdf3$CSTOCK_80
+pltdf3$IS_HIGH %<>% ifelse('Top 20%',
+                          'Bottom 80%')
+
+pltdf3$name %<>% 
+  gsub('SAND', expression(paste('Sand [g', ~g^-1, ']', sep='')), .) %>% 
+  gsub('SILT', expression(paste('Silt [g', ~g^-1, ']', sep='')), .) %>% 
+  gsub('ELEVATION', expression(paste('Elevation [m]', '', sep='')), .) %>% 
+  factor(., levels=sort(unique(.))[c(1,2,3)])
+
+
+fig3 = ggplot(pltdf3,
+       aes(x=value,
+           y=CSTOCK_NOW)) +
+  facet_wrap(~name, 
+             scales='free_x',
+             strip.position='bottom',
+             labeller=label_parsed) +
+  scale_color_manual(values=c('#BBBBBB', '#666666')) +
+  geom_point(aes(color=IS_HIGH),
+             size=0.3) +
+  geom_smooth(aes(y=CSTOCK_80),
+              method='lm',
+              formula='y~x',
+            color='black',
+            se=FALSE,
+            size=0.3, 
+            linetype='dashed') +
+  labs(x=NULL,
+       y=expression(paste('Current SOC Stock [Mg C ', ~ha^-1, ']', sep='')),
+       color=NULL) +
+  guides(color='none') +
+  theme_minimal() +
+  theme(axis.title=element_text(size=8),
+        title=element_text(size=8),
+        legend.text=element_text(size=9),
+        strip.placement='outside',
+        panel.grid.minor=element_blank(),
+        # strip.text=element_text(size=8, hjust=0),
+        legend.position=NULL)
+
+fig3
+```
+## Export
+```{r}
+here('Results', 'Fig 3 - Potentials Predictors.jpg') %>% 
+  jpeg(height=2.5, width=6.5, units='in', res=300)
+fig3
+dev.off()
+```
+
+
+# Export
+Items to save:
+
+1. Pedotransfer function
+2. C potential model - field, iSDA
+3. Calculated potentials (as a new point object)
+4. Fig2 dataframe
+
+```{r}
+pedotransfer_obj = list(model = pedotransfer, 
+                        crossvalid = pedotransfer_CV, 
+                        cv_stats = pedotransfer_fit)
+
+carbon_potential_mods = list(field = qr_mod,
+                             isda = isda_qr)
+
+calc_potentials = c('SAMPLEID', 'EPA', 'YEAR', 'DISTRICT', '_NOW', '_80', 'CGAP') %>% 
+  sapply(grepl, names(pt)) %>% 
+  apply(1, any) %>% 
+  pt[, .]
+
+fig2df = pltdf
+fig3df = pltdf3
+
+save(pedotransfer_obj,
+     carbon_potential_mods,
+     calc_potentials,
+     pt,
+     colors,
+     fig2df,
+     fig3df, 
+     file = here('Data', 'Fig 2 - Field Estimates.Rdata'))
+```
+
+
+

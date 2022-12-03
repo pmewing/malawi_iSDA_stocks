@@ -1,0 +1,1630 @@
+---
+title: "Fig 3 - Value of Correcting iSDA Estimates of Carbon Stocks"
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding=encoding, output_dir=here::here('Results'))})
+output:
+  html_document:
+    toc: true
+    toc_depth: 5
+    toc_float: true
+    df_print: paged
+    code_folding: hide
+author: PME
+---
+
+This notebook will address Hypothesis 2 (see Fig 2 notebook):
+
+"This local groundtruthing can be used to improve iSDA estimates of carbon stocks
+and storage potential at unmeasured sites within the region"
+
+We will adjust iSDA estimates in two ways:
+1. A "bottom-up" approach where underlying parameters like carbon concentration are corrected
+2. A "top-down" approach that directly corrects carbon stock predictions
+
+We will further split these adjustment methods into two sets of assumptions:
+1. Assuming a stationary relationship between iSDA and observed parameters
+2. Relaxing stationarity by allowing the relationship between iSDA and observed 
+paramters to vary across space.
+
+The reason for testing for stationary relationships is to justify or refute 
+whether we can correct iSDA in areas beyond the immediate region of our sampling, 
+i.e. all of Malawi. If the relationship is relatively stationary across the 
+climatic and physical gradients of our sample area, then we can assume that 
+interpolations within our study area are valid, and extrapolations beyond the 
+study area (but within Malawi) are likely valid. On the other hand, if the 
+relationship is highly spatially variable then interpolation may not be valid. 
+
+Either way, extrapolation or interpolation will remain within Malawi because 
+iSDA training datasets vary with geopolitical boundaries. 
+
+# Load
+
+## Paths, Variables, Libraries
+
+Variables
+```{r}
+set_datum = 'epsg:4326'  # WGS84
+set_projection = 'epsg:32736'  # utm 36S.
+# output
+overwrite = FALSE
+# overwrite = TRUE
+```
+
+Paths to folders. Data will be loaded from rdata after running Figure 2,3 notebook. 
+```{r}
+# locations
+in_dir = 'Data'
+dir_spatial = 'Spatial' # in in_dir
+out_dir = 'Results'
+# in_isda = 'ISDA_AR_MWI.tif'
+# in_suit = 'LI_ETAL_2017_MW_AGRI_LAND_SUIT.tif'  # cropland suitability
+
+```
+
+Libraries
+```{r}
+libs = c(
+  # Coding helpers
+  'here', 
+  'tidyr',
+  'magrittr',
+  
+  # spatial stuff
+  'ape',
+  'sf',
+  'GWmodel',
+  
+  # Other modeling
+  'glmnet',
+  'quantreg',
+  'car',
+  'pROC',
+  
+  # plotting
+  'ggplot2',
+  'gridExtra',
+  'gt',
+  'ggcorrplot'
+)
+```
+
+```{r message=FALSE}
+for (i in libs) {
+  if (!require(i, character.only=TRUE)) {
+    renv::install(i)
+    require(i, character.only=TRUE)
+}}
+
+resource = function() {
+  ll = here('Scripts', 'V3 Functions') %>% 
+  list.files(full.names=TRUE)
+  for (i in ll) {
+    source(i)
+  }
+}
+resource()
+
+```
+
+Versions
+```{r}
+sapply(libs, function(x) as.character(packageVersion(x))) %>% 
+  as.matrix %>% 
+  set_colnames(R.version.string)
+```
+
+
+
+## Load Data
+```{r}
+load(here('Data', 'Fig 2 - Field Estimates.Rdata'))
+```
+
+## Object Structures
+```{r}
+models = list()
+```
+
+
+# Top-down
+First, we will correct iSDA stock estimates using locally collected data.
+
+Algorithm:
+
+1. Regress field vs iSDA estimates
+2. Correct
+3. Cross-validate
+
+We will try 1-3rd order polynomials as the relationship is non-linear.
+
+## Stationary
+```{r}
+prediction = "top down stationary"
+x = "ISDA_CSTOCK_NOW"
+y = "CSTOCK_NOW"
+poly = seq_len(3)
+transform = 'identity'
+
+base_ff =
+paste(y, x, sep='~') %>%
+  formula
+
+dd = model.frame(base_ff, data=pt)
+ffs = lapply(poly, function(i) {
+  paste(y, '~ poly(', x, ', degree=', i, ')', sep='') %>%
+    formula
+})
+mms = lapply(ffs, function(i) glm(i, data=dd, family=gaussian(link=transform)))
+
+do.call(anova, mms)
+
+mm = sapply(mms, AIC) %>% 
+  matrix(nrow=1) %>% 
+  set_rownames('AIC') %T>%
+  print %>% 
+  which.min %>% 
+  mms[[.]]
+```
+
+
+```{r}
+par(mfrow=c(2,2)); plot(mm); par(mfrow=c(1,1))
+```
+
+### Cross Validate
+```{r}
+cv_grp = generate_cv_groups(pt[!is.na(pt[, x]), ], 'EPA')
+top_stat_cv = cv_glm(mm, pt, base_formula=base_ff, groups=cv_grp)
+```
+```{r}
+top_stat_indices = prediction_indices(top_stat_cv, pt[, y], TRUE)
+```
+Prediction error is 30%, but with a high coefficient of determination. Spatial autocorrelation
+of error is significant but not large. 
+
+```{r}
+models[[prediction]] = mm
+```
+
+## Geographically weighted
+Using geographically weighted regression. 
+```{r}
+stat_model = 'top down stationary'
+prediction = 'top down geographic'
+
+mm = models[['top down stationary']]
+gw = gwr_from_glm(mm, pt, transform=transform)
+
+models[[prediction]] = gw
+```
+
+### Cross Validate
+```{r cache=TRUE}
+top_gw_cv = cv_gwr(gw, pt, groups=cv_grp)
+```
+
+
+```{r}
+top_gw_indices = prediction_indices(top_gw_cv, pt[, y], TRUE)
+```
+The GWR model has modestly improved predictive power and reduced spatial autocorrelation. But
+the improvements are very small, <5%. 
+
+# Bottom-up
+This approach requires calculating stocks from component items - bulk density and carbon concentrations. 
+## Components
+### Sand
+```{r}
+prediction = 'bottom sand'
+x = "ISDA_SAND"
+y = "SAND"
+poly = seq_len(2)
+transform = 'logit'
+
+base_ff = paste(y, x, sep='~') %>% 
+  formula
+
+dd = model.frame(base_ff, data=pt)
+ffs = lapply(poly, function(i) {
+  paste(y, '~ poly(', x, ', degree=', i, ')', sep='') %>% 
+    formula
+})
+mms = lapply(ffs, function(i) glm(i, data=dd, family=gaussian(link=transform)))
+
+do.call(anova, mms)
+
+mm = sapply(mms, AIC) %>% 
+  matrix(nrow=1) %>% 
+  set_rownames('AIC') %T>%
+  print
+which.min(mm) %>% 
+  paste('Best poly degree:', .) %>% 
+  message
+mm %<>%
+  which.min %>% 
+  mms[[.]]
+
+models[[prediction]] = mm
+```
+
+
+```{r}
+par(mfrow=c(2,2)); plot(mm); par(mfrow=c(1,1))
+```
+
+#### CV-predictions
+```{r}
+sand_stat_cv = cv_glm(mm, pt, groups=cv_grp)
+```
+
+```{r}
+sand_stat_indices = prediction_indices(sand_stat_cv, pt[, y], TRUE)
+```
+
+### Silt
+```{r}
+prediction = 'bottom silt'
+x = "ISDA_SILT"
+y = "SILT"
+poly = seq_len(2)
+transform = 'logit'
+
+base_ff = paste(y, x, sep='~') %>% 
+  formula
+
+dd = model.frame(base_ff, data=pt)
+ffs = lapply(poly, function(i) {
+  paste(y, '~ poly(', x, ', degree=', i, ')', sep='') %>% 
+    formula
+})
+mms = lapply(ffs, function(i) glm(i, data=dd, family=gaussian(link=transform)))
+
+do.call(anova, mms)
+
+mm = sapply(mms, AIC) %>% 
+  matrix(nrow=1) %>% 
+  set_rownames('AIC') %T>%
+  print
+which.min(mm) %>% 
+  paste('Best poly degree:', .) %>% 
+  message
+mm %<>%
+  which.min %>% 
+  mms[[.]]
+
+models[[prediction]] = mm
+```
+
+
+```{r}
+par(mfrow=c(2,2)); plot(mm); par(mfrow=c(1,1))
+```
+
+#### CV-predictions
+```{r}
+silt_stat_cv = cv_glm(mm, pt, groups=cv_grp)
+```
+
+```{r}
+silt_stat_indices = prediction_indices(silt_stat_cv, pt[, y], TRUE)
+```
+
+
+### Clay
+```{r}
+prediction = 'bottom clay'
+x = "ISDA_CLAY"
+y = "CLAY"
+poly = seq_len(2)
+transform = 'logit'
+
+base_ff = paste(y, x, sep='~') %>% 
+  formula
+
+dd = model.frame(base_ff, data=pt)
+ffs = lapply(poly, function(i) {
+  paste(y, '~ poly(', x, ', degree=', i, ')', sep='') %>% 
+    formula
+})
+mms = lapply(ffs, function(i) glm(i, data=dd, family=gaussian(link=transform)))
+
+do.call(anova, mms)
+
+mm = sapply(mms, AIC) %>% 
+  matrix(nrow=1) %>% 
+  set_rownames('AIC') %T>%
+  print
+which.min(mm) %>% 
+  paste('Best poly degree:', .) %>% 
+  message
+mm %<>%
+  which.min %>% 
+  mms[[.]]
+
+
+models[[prediction]] = mm
+```
+
+
+```{r}
+par(mfrow=c(2,2)); plot(mm); par(mfrow=c(1,1))
+```
+
+#### CV-predictions
+```{r}
+clay_stat_cv = cv_glm(mm, pt, groups=cv_grp)
+```
+
+```{r}
+clay_stat_indices = prediction_indices(clay_stat_cv, pt[, y], TRUE)
+```
+
+
+### Organic Matter
+```{r}
+prediction = 'bottom totalc'
+x = "ISDA_SOC"  # does not need to be converted because is predictor. 
+y = "TOTALC_gg"
+poly = seq_len(2)
+transform = 'logit'
+
+# convert totalc to compositional units for logistic regression.
+pt$TOTALC_gg = pt$TOTALC/1000
+
+base_ff = paste(y, x, sep='~') %>% 
+  formula
+
+dd = model.frame(base_ff, data=pt)
+ffs = lapply(poly, function(i) {
+  paste(y, '~ poly(', x, ', degree=', i, ')', sep='') %>% 
+    formula
+})
+mms = lapply(ffs, function(i) glm(i, data=dd, family=gaussian(link=transform)))
+
+do.call(anova, mms)
+
+mm = sapply(mms, AIC) %>% 
+  matrix(nrow=1) %>% 
+  set_rownames('AIC') %T>%
+  print
+which.min(mm) %>% 
+  paste('Best poly degree:', .) %>% 
+  message
+mm %<>%
+  which.min %>% 
+  mms[[.]]
+
+
+models[[prediction]] = mm
+```
+
+#### CV-predictions
+```{r}
+som_stat_cv = cv_glm(mm, pt, groups=cv_grp)
+```
+```{r}
+som_stat_indices = prediction_indices(som_stat_cv, pt[, y], TRUE)
+```
+
+Now rescale to g/kg for downstream applications
+```{r}
+som_stat_cv %<>% multiply_by(1000)
+```
+
+
+### Bulk Density
+#### Correlated performs poorly 
+```{r}
+prediction = 'bottom bd correlate'
+x = "ISDA_BD"
+y = "BULK_DENSITY"
+poly = seq_len(2)
+transform = 'identity'
+
+base_ff = paste(y, x, sep='~') %>% 
+  formula
+
+dd = model.frame(base_ff, data=pt)
+ffs = lapply(poly, function(i) {
+  paste(y, '~ poly(', x, ', degree=', i, ')', sep='') %>% 
+    formula
+})
+mms = lapply(ffs, function(i) glm(i, data=dd, family=gaussian(link=transform)))
+
+do.call(anova, mms)
+
+mm = sapply(mms, AIC) %>% 
+  matrix(nrow=1) %>% 
+  set_rownames('AIC') %T>%
+  print
+which.min(mm) %>% 
+  paste('Best poly degree:', .) %>% 
+  message
+mm %<>%
+  which.min %>% 
+  mms[[.]]
+
+
+models[[prediction]] = mm
+```
+##### CV-predictions
+```{r}
+bd_cv_grp = generate_cv_groups(pt[!is.na(pt[, y]), ], 'EPA')
+bd_stat_cv = cv_glm(mm, pt, groups=bd_cv_grp)
+```
+
+```{r}
+bd_stat_indices = prediction_indices(bd_stat_cv, pt[, y], TRUE)
+```
+
+```{r}
+plot(bd_stat_cv[ ,1], data.frame(pt)[rownames(bd_stat_cv), y],
+     xlab="predicted",
+     ylab="observed")
+```
+
+
+#### Calculated from the pedotransfer function performs better.
+```{r}
+dd = merge(som_stat_cv['cv_fit'], 
+           sand_stat_cv['cv_fit'], 
+           by='row.names', 
+           all=TRUE) %>% 
+  set_colnames(c('r', 'TOTALC', 'SAND')) %>% 
+  set_rownames(., .$r)
+bd_calc = predict(pedotransfer_obj$model, dd)
+```
+
+
+```{r}
+obs = na.omit(pt[y])
+pred = data.frame(
+  cv_fit = bd_calc[rownames(obs)]
+)
+bd_calc_indices = prediction_indices(pred, obs, TRUE)
+```
+But still isn't awesome. 
+
+```{r}
+plot(pred[,1], data.frame(obs)[,1], xlab='predicted', ylab='observed')
+```
+
+## Calculate stocks
+Do need to rescale SOM to compositional for this step due to how calc_stock was written. 
+```{r}
+stock_bot_stat = 
+  merge(som_stat_cv['cv_fit'],
+           as.data.frame(bd_calc),
+           by='row.names',
+           all=TRUE) %>% 
+  set_colnames(c('r', 'SOM_CV', 'BD_CALC')) %>% 
+  set_rownames(., .$r)
+stock_bot_stat$r = NULL
+
+stock_bot_stat$CSTOCK = with(stock_bot_stat,
+                             calc_stock(SOM_CV/1000,
+                                        BD_CALC,
+                                        0.2)
+)
+```
+
+### CV Indices
+```{r}
+pred = stock_bot_stat['CSTOCK'] %>% 
+  set_colnames('cv_fit') %>% 
+  na.omit
+obs = pt[rownames(pred), 'CSTOCK_NOW', drop=FALSE]
+stock_bot_stat_indices = prediction_indices(pred, obs, TRUE)
+```
+
+
+```{r}
+plot(data.frame(obs)[,1],
+     pred[,1],
+     xlab="observed",
+     ylab="predicted")
+abline(a=0, b=1, col='blue')
+```
+
+# Calculate potentials and gaps
+```{r}
+potential_stocks = list()
+```
+
+## Top-down, stationary
+```{r}
+y = 'CSTOCK_NOW_TOP_STAT'
+x = c('ISDA_SAND', 'ISDA_SILT', 'ISDA_CLAY', 'ELEVATION', 'PRECIP_DAILY', 'LST')
+
+transform = 'identity'
+
+dd = top_stat_cv['cv_fit'] %>% 
+  set_colnames(y) %>%
+  merge(pt, by='row.names') %>% 
+  set_rownames(., .$Row.names)
+
+cstock_top_stat_lasso = paste(x, collapse='+') %>% 
+  paste(y, ., sep='~') %>% 
+  formula %>% 
+  run_glmnet(data=dd,        # wrapper that uses model.frame and model.matrix to make x and y matrices for glmnet.
+             link=transform, # of gaussian model
+             alpha=.95)
+```
+```{r}
+coef(cstock_top_stat_lasso$cv_mod, s='lambda.1se')
+```
+
+### Evaluate briefly
+For whether we're using an appropriate model
+```{r fig.height=6, fig.width=6}
+cstock_top_stat_lasso_pred = glm_from_glmnet(dd, cstock_top_stat_lasso, y=y, link=transform,
+                                             plot=TRUE)
+```
+Heterskedastic but not too awful. 
+
+```{r}
+Anova(cstock_top_stat_lasso_pred, test.statistic='F')
+```
+Again, texture is redundant. Precipitation isn't meaningful in addition to the other variables. 
+```{r}
+plot_glm(cstock_top_stat_lasso_pred, pt, colors=pt[, 'EPA'])
+```
+A nice, linear relationship with some areas more difficult to estimate than others. 
+
+```{r}
+cstock_top_stat_predictors =
+  cstock_top_stat_lasso_pred %>% 
+  Anova(test.statistic='F') %>% 
+  .[which(.[, 4] < 0.05), ] %>% 
+  rownames
+```
+
+### Estimate Potential Stocks
+
+
+To estimate, we'll use quantile regression 
+```{r}
+C_form = paste(cstock_top_stat_predictors, collapse='+') %>% 
+  paste(y, ' ~', .) %>% 
+  formula
+
+quantiles = c(0.8)
+qr_mod = rq(C_form, data=dd, tau=quantiles, ci=TRUE)
+summary(qr_mod)
+
+potential_stocks$top_stat = qr_mod
+
+```
+
+```{r}
+top_stat_potentials = predict(qr_mod, pt) %>% 
+  .[, 1, drop=FALSE] %>% 
+  set_colnames(paste0('CPOT_', 100*quantiles)) %>% 
+  set_rownames(rownames(pt))
+```
+
+```{r}
+top_stat_stocks = merge(top_stat_potentials,
+                        top_stat_cv['cv_fit'], 
+                        by='row.names') %>% 
+  set_rownames(.$Row.names) %>% 
+  set_names(c('x', 'TOP_STAT_CSTOCK_80', 'TOP_STAT_CSTOCK_NOW'))
+top_stat_stocks$TOP_STAT_CGAP = with(top_stat_stocks, 
+                    TOP_STAT_CSTOCK_80 - TOP_STAT_CSTOCK_NOW)
+```
+
+
+
+## Top-down, non-stationary
+```{r}
+y = 'CSTOCK_NOW_TOP_GW'
+x = c('ISDA_SAND', 'ISDA_SILT', 'ISDA_CLAY', 'ELEVATION', 'PRECIP_DAILY', 'LST')
+
+transform = 'identity'
+
+dd = top_gw_cv['cv_fit'] %>% 
+  set_colnames(y) %>%
+  merge(pt, by='row.names') %>% 
+  set_rownames(., .$Row.names)
+
+cstock_top_gw_lasso = paste(x, collapse='+') %>% 
+  paste(y, ., sep='~') %>% 
+  formula %>% 
+  run_glmnet(data=dd,        # wrapper that uses model.frame and model.matrix to make x and y matrices for glmnet.
+             link=transform, # of gaussian model
+             alpha=.95)
+```
+```{r}
+coef(cstock_top_gw_lasso$cv_mod, s='lambda.1se')
+```
+
+### Evaluate briefly
+For whether we're using an appropriate model
+```{r fig.height=6, fig.width=6}
+cstock_top_gw_lasso_pred = glm_from_glmnet(dd, cstock_top_gw_lasso, y=y, link=transform,
+                                             plot=TRUE)
+```
+Heterskedastic but not too awful. 
+
+```{r}
+Anova(cstock_top_gw_lasso_pred, test.statistic='F')
+```
+Again, texture is redundant. Precipitation isn't meaningful in addition to the other variables. 
+```{r}
+plot_glm(cstock_top_gw_lasso_pred, pt, colors=pt[, 'EPA'])
+```
+A nice, linear relationship with better estimation in some areas (ex. Kandeu)
+
+```{r}
+cstock_top_gw_predictors =
+  cstock_top_gw_lasso_pred %>% 
+  Anova(test.statistic='F') %>% 
+  .[which(.[, 4] < 0.05), ] %>% 
+  rownames %T>%
+  print
+```
+
+### Estimate Potential Stocks
+To estimate, we'll use quantile regression 
+```{r}
+C_form = paste(cstock_top_gw_predictors, collapse='+') %>% 
+  paste(y, ' ~', .) %>% 
+  formula
+
+quantiles = c(0.8)
+qr_mod = rq(C_form, data=dd, tau=quantiles, ci=TRUE)
+summary(qr_mod)
+
+potential_stocks$top_gw = qr_mod
+```
+
+```{r}
+top_gw_potentials = predict(qr_mod, pt) %>% 
+  .[, 1, drop=FALSE] %>% 
+  set_colnames(paste0('CPOT_', 100*quantiles)) %>% 
+  set_rownames(rownames(pt))
+```
+
+```{r}
+top_gw_stocks = merge(top_gw_potentials,
+                        top_gw_cv['cv_fit'], 
+                        by='row.names') %>% 
+  set_rownames(.$Row.names) %>% 
+  set_names(c('x', 'TOP_GW_CSTOCK_80', 'TOP_GW_CSTOCK_NOW'))
+top_gw_stocks$TOP_GW_CGAP = with(top_gw_stocks, 
+                    TOP_GW_CSTOCK_80 - TOP_GW_CSTOCK_NOW)
+```
+
+
+
+```{r}
+
+top_gw_potentials = predict(qr_mod, pt) %>% 
+  matrix %>% 
+  set_colnames(paste0('CPOT_', 100*quantiles)) 
+```
+
+## Bottom-up, stationary
+Build a dataframe using corrected texture inputs. Ensure SOM is in g/g for use with logit (and plays well with calc_stock()). 
+```{r}
+tt = list(BOT_SAND = sand_stat_cv,
+          BOT_SILT = silt_stat_cv,
+          BOT_CLAY = clay_stat_cv,
+          BOT_SOM = som_stat_cv/1000
+) %>% 
+  lapply('[', 'cv_fit')
+tt[['BOT_BD']] = bd_calc
+dd = tt[[1]]
+for (i in 2:length(tt)) {
+  dd %<>% 
+    merge(tt[[i]], by='row.names') %>% 
+    set_rownames(.$Row.names)
+  dd$Row.names=NULL
+}
+dd %<>% 
+  set_colnames(names(tt)) %>% 
+  merge(pt, by='row.names') %>% 
+  set_rownames(.$Row.names)
+```
+
+
+```{r}
+y = 'BOT_SOM'
+x = c('BOT_SAND', 'BOT_SILT', 'BOT_CLAY', 'ELEVATION', 'PRECIP_DAILY', 'LST')
+
+transform = 'logit'
+
+som_bot_stat_lasso = paste(x, collapse='+') %>% 
+  paste(y, ., sep='~') %>% 
+  formula %>% 
+  run_glmnet(data=dd,        # wrapper that uses model.frame and model.matrix to make x and y matrices for glmnet.
+             link=transform, # of gaussian model
+             alpha=0.95)
+```
+
+```{r}
+coef(som_bot_stat_lasso$cv_mod, s='lambda.1se')
+```
+
+### Evaluate briefly
+For whether we're using an appropriate model
+```{r fig.height=6, fig.width=6}
+som_bot_stat_lasso_pred = glm_from_glmnet(dd, som_bot_stat_lasso, y=y, link=transform,
+                                             plot=TRUE)
+```
+Heterskedastic but not too awful. 
+
+```{r}
+Anova(som_bot_stat_lasso_pred, test.statistic='F')
+```
+ 
+```{r}
+plot_glm(som_bot_stat_lasso_pred, pt, colors=pt[, 'EPA'])
+```
+A nice, linear relationship with some areas more difficult to estimate than others. 
+
+```{r}
+som_bot_stat_predictors =
+  som_bot_stat_lasso_pred %>% 
+  Anova(test.statistic='F') %>% 
+  .[which(.[, 4] < 0.05), ] %>% 
+  rownames %T>%
+  print
+```
+
+### Estimate Potential SOM
+To estimate, we'll use quantile regression 
+```{r}
+C_form = paste(som_bot_stat_predictors, collapse='+') %>% 
+  paste('logit(', y, ') ~', .) %>% 
+  formula
+
+quantiles = c(0.8)
+qr_mod = rq(C_form, data=dd, tau=quantiles, ci=TRUE)
+summary(qr_mod)
+
+potential_stocks$bot_totalc = qr_mod
+
+```
+
+```{r}
+dd[, paste0('BOT_SOM_', 100*quantiles)] = 
+  predict(qr_mod, dd) %>%
+  .[, 1, drop=TRUE] %>% 
+  ilogit
+```
+
+### Calculate Potential Stocks
+calc_stock expects carbon in g/g. 
+```{r}
+dd$BOT_BD_80 = data.frame(SAND = dd$BOT_SAND,
+                       TOTALC = dd$BOT_SOM_80) %>% 
+  predict(pedotransfer_obj$model, .)
+
+dd$BOT_CSTOCK_NOW = with(dd, 
+                     calc_stock(BOT_SOM, 
+                                BOT_BD, 
+                                0.2))
+dd$BOT_CSTOCK_80 = with(dd, 
+                    calc_stock(BOT_SOM_80, 
+                               BOT_BD_80, 
+                               0.2))
+
+dd$BOT_CGAP = with(dd, 
+               BOT_CSTOCK_80 - BOT_CSTOCK_NOW)
+bot_stat_stocks = dd[, grepl('BOT', colnames(dd))]
+```
+
+# Evaluate
+```{r}
+merge_rownames = function(x, y, ...) {
+  out = merge(x, y, by='row.names', ...) %>% 
+    set_rownames(.$Row.names)
+  out$Row.names=NULL
+  return(out)
+}
+corrections = merge_rownames(bot_stat_stocks, top_stat_stocks) %>% 
+  merge_rownames(top_gw_stocks) %>% 
+  merge_rownames(pt)
+```
+
+
+## Prediction bias, error, and spatial variance
+Make a sf dataframe
+```{r}
+make_pred_df = function(string, corrections, sf_source) {
+  pred_df = grepl(string, colnames(corrections)) %>% 
+    corrections[, .]
+  coords = 
+    sf_source[rownames(pred_df), ] %>% 
+    st_coordinates
+  pred_df %<>% cbind(coords, .) %>% 
+    st_as_sf(coords=c(1,2))
+  st_crs(pred_df) = st_crs(sf_source) 
+  return(pred_df)
+}
+
+```
+
+### Stocks
+```{r}
+string = 'CSTOCK_NOW'
+
+pred_df = make_pred_df(string, corrections, pt) %>% 
+  na.omit()
+drop_cols = names(pred_df) %in% c(string, 'geometry')
+stock_cv = names(pred_df)[!drop_cols] %>% 
+  sapply(function(x) {
+    pred = data.frame(pred_df)[x] %>% 
+      set_colnames('cv_fit')
+    obs = pred_df[string]
+    out = prediction_indices(pred, obs, TRUE)
+  return(out)
+}) %>% 
+  t
+  
+stock_cv
+```
+All corrections predict current stocks much better than iSDA, with 40% smaller errors. Geogrpahically weighted performs *slightly* better than others. Bottom-up does not perform as well as top-down corrections. 
+
+```{r}
+data.frame(pred_df)[-c(ncol(pred_df))] %>% 
+  {scatterplotMatrix(.)}
+```
+
+### Potential
+```{r}
+string = 'CSTOCK_80'
+
+pred_df = make_pred_df(string, corrections, pt) %>% 
+  na.omit()
+drop_cols = names(pred_df) %in% c(string, 'geometry')
+potential_cv = names(pred_df)[!drop_cols] %>% 
+  sapply(function(x) {
+    pred = data.frame(pred_df)[x] %>% 
+      set_colnames('cv_fit')
+    obs = pred_df[string]
+    out = prediction_indices(pred, obs, TRUE)
+  return(out)
+}) %>% 
+  t
+  
+potential_cv
+```
+Errors are 50% smaller for potential stocks compared to uncorrected iSDA - and iSDA is unable to predict carbon storage potential (negative coefficient of determination). Spatial dependence of error is becoming substantial, and further data collection is necessary at unobserved regions. 
+
+```{r}
+data.frame(pred_df)[-c(ncol(pred_df))] %>% 
+  {scatterplotMatrix(.)}
+```
+
+```{r}
+with(pred_df, plot(CSTOCK_80, ISDA_CSTOCK_80))
+abline(a=0, b=1, col='blue')
+```
+
+
+
+### Gaps
+```{r}
+string = 'CGAP'
+
+pred_df = make_pred_df(string, corrections, pt) %>% 
+  na.omit()
+drop_cols = names(pred_df) %in% c(string, 'geometry')
+gap_cv = names(pred_df)[!drop_cols] %>% 
+  sapply(function(x) {
+    pred = data.frame(pred_df)[x] %>% 
+      set_colnames('cv_fit')
+    obs = pred_df[string]
+    out = prediction_indices(pred, obs, TRUE)
+  return(out)
+}) %>% 
+  t
+  
+gap_cv
+```
+Corrections are much better at capturing variation in carbon gaps than iSDA. Interestingly, 
+the stationary model is most effective and has the least autocorrelation of residuals. 
+
+```{r}
+scatterplotMatrix(data.frame(pred_df)[sample(seq_len(nrow(pred_df)), 500), -c(6)])
+```
+
+### TABLE 1: Summary Table
+```{r}
+sumtab = rbind(stock_cv,
+               potential_cv,
+               gap_cv) %>% 
+  as.data.frame
+
+sumtab$Method = sapply(rownames(sumtab), function(x) {
+  if (grepl('BOT', x)) 'Bottom-Up'
+  else if (grepl('STAT', x)) 'Stationary (Top-Down)'
+  else if (grepl('GW', x)) 'GWR (Top-Down)'
+  else if (grepl('ISDA', x)) 'iSDA'
+  else NA
+}) %>% 
+  factor(levels=c('iSDA', 'Stationary (Top-Down)', 'GWR (Top-Down)', 'Bottom-Up'))
+sumtab = sumtab[order(sumtab$Method), ]
+sumtab$Method %<>% as.character
+
+sumtab$Measure = rownames(sumtab) %>% 
+  sapply(function(x) {
+    if (grepl('CSTOCK_NOW', x)) 'Current Stock'
+    else if (grepl('CSTOCK_80', x)) 'Potential Stock'
+    else if (grepl('CGAP', x)) 'Current Gap'
+    else NA
+  })
+
+sumtab$moran_I_pr %<>% 
+  sapply(function(x) {
+    if (x <= 0.1 & x > 0.05) '.'
+    else if (x <= 0.05) '*'
+    else NA
+  })
+sumtab$morI = paste0(sumtab$moran_I, sumtab$moran_I_pr)
+rownames(sumtab) = NULL
+# reorder
+
+sumtab %<>% .[c('Measure', 'Method', 'RMSPE', 'R2', 'morI')]  %>% 
+  pivot_wider(names_from='Measure', values_from=c('RMSPE', 'R2', 'morI'), names_vary='slowest')
+```
+
+
+```{r}
+col_sel = function(x) names(sumtab)[grepl(x, names(sumtab))]
+
+
+cols_rename = names(sumtab) %>% 
+  .[grepl('_', .)] %>% 
+  strsplit('_') %>% 
+  sapply('[', 1)
+names(cols_rename) = names(sumtab)[grepl('_', names(sumtab))]
+cols_rename[grepl('R2', cols_rename)] = html("<em>R</em><sup>2</sup>")
+cols_rename[grepl('morI', cols_rename)] = md("Moran's *I*")  
+
+tbl = gt(sumtab,
+         rowname_col='Method') %>%
+  tab_header(title=md('**Table 1**: Prediction characteristics of iSDA adjustments')) %>% 
+  tab_stubhead(label='Adjustment Method') %>% 
+  tab_source_note(source_note=md('\\* *p* < 0.001')) %>% 
+  tab_spanner(label='Current Stock',
+              columns=col_sel('Current Stock')) %>% 
+  tab_spanner(label='Potential Stock',
+              columns=col_sel('Potential Stock')) %>% 
+  tab_spanner(label='Current Gap',
+              columns=col_sel('Current Gap')) %>% 
+  cols_label(
+    `RMSPE_Current Stock`='RMSPE',
+    `R2_Current Stock`=html('<em>R</em><sup>2</sup>'),
+    `morI_Current Stock`=md("Moran's *I*"),
+    `RMSPE_Potential Stock`='RMSPE',
+    `R2_Potential Stock`=html('<em>R</em><sup>2</sup>'),
+    `morI_Potential Stock`=md("Moran's *I*"),
+    `RMSPE_Current Gap`='RMSPE',
+    `R2_Current Gap`=html('<em>R</em><sup>2</sup>'),
+    `morI_Current Gap`=md("Moran's *I*")
+  )
+  
+tbl
+```
+
+```{r}
+here(out_dir, 'Table 1 - Prediction Indices.html') %>% 
+  gtsave(tbl, ., )
+```
+
+
+## Ability to identify high-priority sites
+### Cumulative gap with sites
+```{r}
+gaps = corrections[, grepl('CGAP', names(corrections))] %>% 
+  na.omit
+
+# calculate cumulative sum and formulate into a data.frame
+cs_gaps = apply(gaps, 2, function(x) {
+  tt = x[x>0] %>% 
+    na.omit %>% 
+    sort(decreasing=TRUE)
+  get_percentile = ecdf(tt)
+  site_pct = 1-get_percentile(tt)
+  gap_pct = cumsum(tt/sum(tt))
+  out = data.frame(
+    sid = names(tt),
+    site_pct = site_pct,
+    gap_pct = gap_pct
+  ) %>% 
+    set_rownames(NULL)
+  return(out)
+})
+
+cs_gaps %<>% 
+  names %>% 
+  lapply(function(x) {
+    tt = cs_gaps[[x]]
+    tt$measure = x
+    return(tt)
+  }) %>% 
+  do.call(rbind, .)
+
+new_names = c(ISDA_CGAP = 'iSDA',
+              TOP_STAT_CGAP = 'Stationary (Top-Down)',
+              TOP_GW_CGAP = 'GWR (Top-Down)',
+              BOT_CGAP = 'Bottom-Up',
+              CGAP = 'Empirical')
+
+cs_gaps$measure %<>%
+  new_names[.] %>% 
+  factor(levels=new_names)
+```
+
+
+```{r}
+cs_plt = 
+  ggplot(cs_gaps,
+       aes(x=100*site_pct,
+           y=100*gap_pct,
+           color=measure)) +
+  geom_hline(aes(yintercept=0),
+             size=0.2,
+             color='gray') +
+  geom_vline(aes(xintercept=0),
+             size=0.2,
+             color='gray') +
+  geom_segment(aes(x=0,
+                   xend=25,
+                   y=50,
+                   yend=50),
+               linetype='dashed',
+               color='gray',
+               size=0.2) +
+  geom_segment(aes(x=25,
+                  xend=25,
+                  y=0, 
+                  yend=50),
+               linetype='dashed',
+              color='gray',
+              size=0.2) +
+  geom_path() +
+  geom_point(aes(x=25,
+                 y=50),
+             color='darkgray',
+             size=2) +
+  labs(color=NULL,
+       x='Cumulative Sites [%]',
+       y='Cumulative Carbon Gap [%]',
+       tag='a)')
+cs_plt = gg_themer(cs_plt) +
+  scale_color_brewer(palette='Dark2') +
+  theme(legend.position=c(.85, .3),
+        legend.text=element_text(size=8))
+
+cs_plt
+```
+
+### Identify high-value sites: ROC
+```{r}
+critical_quantile = 0.75
+n_permutes = 999
+
+id_high_priority = function(x, percentile) {
+  has_gap = x > 0
+  x[!has_gap] = 0
+  get_percentile = ecdf(x[has_gap])
+  out =
+    get_percentile(x) %>% 
+    is_greater_than(percentile) %>% 
+    set_names(names(x))
+  return(out)
+}
+
+priority_sites = apply(gaps, 
+                       2, 
+                       id_high_priority, 
+                       critical_quantile)
+
+permute_agreement = function(x, n_permutes, empirical = 'CGAP') {
+  is_empirical = colnames(x) == empirical
+  nobs = nrow(x)
+  
+  permutes = rbind(1:nobs, 
+                 permute::shuffleSet(nobs, n_permutes))
+  
+  test = apply(permutes, 1, function(y) {
+    pp = x[y, is_empirical]
+    test = x[, !is_empirical] %>% 
+      sweep(1, pp, '==') %>% 
+      colSums %>% 
+      divide_by(nobs)
+  })
+  
+  out = cbind(value = test[,1],
+              null_value = rowMeans(test[, -c(1)]),
+              p_val = 1-rowSums(test[,1] > test[,-c(1)])/(n_permutes+1))
+  
+  return(out)
+}
+
+test = permute_agreement(priority_sites, 999)
+test
+```
+All agree with empirical values more often than expected by chance. 
+
+```{r}
+boot_agreement = function(x, n_permutes, empirical = 'CGAP') {
+  is_empirical = colnames(x) == empirical
+  nobs = nrow(x)
+  
+  permutes = seq_len(n_permutes) %>% 
+    sapply(function(y) sample(seq_len(nobs), replace=TRUE))
+  
+  test = apply(permutes, 2, function(y) {
+    pp = x[y, is_empirical]
+    test = x[y, !is_empirical] %>% 
+      sweep(1, pp, '==') %>% 
+      colSums %>% 
+      divide_by(nobs)
+  })
+  
+  out = apply(test, 1, quantile, c(0.025, 0.5, 0.975)) %>% 
+    rbind(avg = rowMeans(test),
+          se = 1.96*apply(test, 1, sd)) %>% 
+    t
+  
+  return(out)
+}
+boot_test = boot_agreement(priority_sites, 999)
+boot_test
+```
+
+
+```{r}
+permute_sensitivity = function(x, n_permutes, empirical = 'CGAP') {
+  is_empirical = colnames(x) == empirical
+  nobs = nrow(x)
+  
+  permutes = rbind(1:nobs, 
+                 permute::shuffleSet(nobs, n_permutes))
+  
+  test = apply(permutes, 1, function(y) {
+    perm = x[y, is_empirical]
+    test = x[, !is_empirical, drop=FALSE]
+    
+    TPR = apply(test, 2, function(z) sum(z[z] == perm[z])) %>% 
+      divide_by(colSums(test))
+  })
+  
+  out = cbind(value = test[,1],
+              null_value = rowMeans(test[, -c(1)]),
+              p_val = 1-rowSums(test[,1] > test[,-c(1)])/(n_permutes+1))
+  
+  return(out)
+}
+sens = permute_sensitivity(priority_sites, 999)
+sens
+```
+sensitivity is higher than expected by chance - particularly for the top-down models
+
+```{r}
+boot_sensitivity = function(x, n_permutes, empirical = 'CGAP') {
+  is_empirical = colnames(x) == empirical
+  nobs = nrow(x)
+  
+  permutes = seq_len(n_permutes) %>% 
+    sapply(function(y) sample(seq_len(nobs), replace=TRUE))
+  
+  test = apply(permutes, 2, function(y) {
+    perm = x[y, is_empirical]
+    test = x[y, !is_empirical, drop=FALSE]
+    
+    TPR = apply(test, 2, function(z) sum(z[z] == perm[z])) %>% 
+      divide_by(colSums(test))
+  })
+  
+  out = apply(test, 1, quantile, c(0.025, 0.5, 0.975)) %>% 
+    rbind(avg = rowMeans(test),
+          se = 1.96*apply(test, 1, sd)) %>% 
+    t
+  
+  return(out)
+}
+boot_sens = boot_sensitivity(priority_sites, 999)
+boot_sens
+```
+
+```{r}
+permute_specificity = function(x, n_permutes, empirical = 'CGAP') {
+  is_empirical = colnames(x) == empirical
+  nobs = nrow(x)
+  
+  permutes = rbind(1:nobs, 
+                 permute::shuffleSet(nobs, n_permutes))
+  
+  test = apply(permutes, 1, function(y) {
+    perm = x[y, is_empirical]
+    test = x[, !is_empirical, drop=FALSE]
+    
+    FNR = apply(test, 2, function(z) sum(z[!z] == perm[!z])) %>% # true negatives
+      divide_by(colSums(!test))  # negatives
+    FNR
+  })
+  
+  out = cbind(value = test[,1],
+              null_value = rowMeans(test[, -c(1)]),
+              p_val = 1-rowSums(test[,1] > test[,-c(1)])/(n_permutes+1))
+  
+  return(out)
+}
+
+spec = permute_specificity(priority_sites, 999)
+spec
+```
+
+```{r}
+boot_specificity = function(x, n_permutes, empirical = 'CGAP') {
+  is_empirical = colnames(x) == empirical
+  nobs = nrow(x)
+  
+  permutes = seq_len(n_permutes) %>% 
+    sapply(function(y) sample(seq_len(nobs), replace=TRUE))
+  
+  test = apply(permutes, 2, function(y) {
+    perm = x[y, is_empirical]
+    test = x[y, !is_empirical, drop=FALSE]
+    
+    FNR = apply(test, 2, function(z) sum(z[!z] == perm[!z])) %>% # true negatives
+      divide_by(colSums(!test))  # negatives
+    FNR
+  })
+  
+  out = apply(test, 1, quantile, c(0.025, 0.5, 0.975)) %>% 
+    rbind(avg = rowMeans(test),
+          se = 1.96*apply(test, 1, sd)) %>% 
+    t
+  
+  return(out)
+}
+
+boot_spec = boot_specificity(priority_sites, 999)
+boot_spec
+```
+
+#### TABLE 2: Classification accuracy
+
+
+```{r}
+sumtab = list(Sensitivity = boot_sens,
+              Specificity = boot_spec,
+              Agreement = boot_test) %>% 
+  lapply(function(x) x[, -c(1:3)]) %>%
+  do.call(cbind, .) %>% 
+  round(3) %>% 
+  as.data.frame
+names(sumtab) %<>% paste(c('sns', 'sns', 'spec', 'spec', 'agr', 'agr'), 
+                           ., 
+                           sep='_')
+  
+
+sumtab$Method = sapply(rownames(sumtab), function(x) {
+  if (grepl('BOT', x)) 'Bottom-Up'
+  else if (grepl('STAT', x)) 'Stationary (Top-Down)'
+  else if (grepl('GW', x)) 'GWR (Top-Down)'
+  else if (grepl('ISDA', x)) 'iSDA'
+  else NA
+}) %>% 
+  factor(levels=c('iSDA', 'Stationary (Top-Down)', 'GWR (Top-Down)', 'Bottom-Up'))
+sumtab = sumtab[order(sumtab$Method), ]
+sumtab$Method %<>% as.character
+
+names(sumtab) %<>% 
+  gsub('avg', 'Mean', .) %>% 
+  gsub('se', 'Std.Err.', .)
+
+```
+
+
+```{r}
+col_sel = function(x) names(sumtab)[grepl(x, names(sumtab))]
+
+tbl = gt(sumtab,
+         rowname_col='Method') %>%
+  tab_header(title=md('**Table 2**: Ability of iSDA adjustments to identify large-gap* sites')) %>% 
+  tab_stubhead(label='Adjustment Method') %>% 
+  tab_source_note(source_note=md('Bootstrapped standard errors (*n* = 999). All *p* < 0.001')) %>% 
+  tab_source_note(source_note=md('\\* sites with the top 25% largest gaps')) %>% 
+  tab_spanner(label='Sensitivity',
+              columns=col_sel('sns')) %>% 
+  tab_spanner(label='Specificity',
+              columns=col_sel('spec')) %>% 
+  tab_spanner(label='Accuracy',
+              columns=col_sel('agr')) %>% 
+  cols_label(
+    `sns_Mean`='Mean',
+    `sns_Std.Err.`='Error',
+    `spec_Mean`='Mean',
+    `spec_Std.Err.`='Error',
+    `agr_Mean`='Mean',
+    `agr_Std.Err.`='Error'  )
+  
+tbl
+```
+
+```{r}
+here(out_dir, 'Table 2 - High-Gap Selection.html') %>% 
+  gtsave(tbl, .)
+```
+
+
+### Agreement among methods
+```{r}
+calc_agreement = function(x) {
+  nn = ncol(x)
+  out = matrix(nrow=nn, ncol=nn) %>% 
+    set_rownames(colnames(x)) %>% 
+    set_colnames(colnames(x))
+
+  for (i in 1:nn){
+    for (j in 1:nn) {
+      out[i, j] = sum(x[, i] == x[, j])
+    }
+  }
+  out %<>% divide_by(nrow(x))
+  return(out)
+}
+
+agreement_mat = calc_agreement(priority_sites) %T>% 
+  print
+
+```
+
+```{r}
+boot_agreement = function(x, times) {
+  samples = nrow(x) %>% 
+    seq_len
+  samples = sapply(seq_len(times), function(y) sample(samples, replace=TRUE))
+  
+  boots = apply(samples, 2, function(y) {
+    calc_agreement(x[y, ]) 
+  }) %>% 
+    array(dim=c(ncol(x), ncol(x), times))
+  
+  low = apply(boots, c(1,2), quantile, 0.025) %>% 
+      set_rownames(colnames(x)) %>% 
+      set_colnames(colnames(x))
+  high = apply(boots, c(1,2), quantile, 0.975) %>% 
+      set_rownames(colnames(x)) %>% 
+      set_colnames(colnames(x))
+  return(list(
+    q025 = low,
+    q975 = high
+  ))
+  
+}
+
+boot_agreement(priority_sites, 999)
+
+```
+
+
+```{r}
+ctrl = 'CGAP'
+rocs = lapply(names(gaps), function(x) {
+  if (x != ctrl) {
+    outcome = priority_sites[, x] == priority_sites[, ctrl]
+    val = gaps[, x]
+    out = roc(outcome, val, ci=TRUE)
+    out
+  }
+}) %>% 
+  set_names(names(gaps))
+rocs[sapply(rocs, is.null)] = NULL
+# lapply(names(rocs), function(x) if (!is.null(rocs[[x]])) plot(rocs[[x]], main=x))
+
+new_names = c(ISDA_CGAP = 'iSDA',
+              TOP_STAT_CGAP = 'Stationary (Top-Down)',
+              TOP_GW_CGAP = 'GWR (Top-Down)',
+              BOT_CGAP = 'Bottom-Up')
+names(rocs) %<>%
+  new_names[.] %>% 
+  factor(levels=new_names)
+
+roc_plt = 
+  ggroc(rocs) +
+  geom_abline(aes(slope=1,
+                  intercept=1),
+              linetype='dashed',
+              color='darkgray',
+              size=0.2) +
+  geom_hline(aes(yintercept=0),
+             size=0.2,
+             color='gray') +
+  geom_vline(aes(xintercept=1),
+             size=0.2,
+             color='gray') +
+  labs(x='Specificity',
+       y='Sensitivity',
+       tag='b)')
+roc_plt = gg_themer(roc_plt) +
+  scale_color_brewer(palette='Dark2') +
+  theme(legend.position='None')
+roc_plt
+```
+
+### Identify sites: AUC
+Are the AUC's different from each other?
+```{r}
+roc_compare_mat = length(rocs) %>% 
+  matrix(NA, nrow=., ncol=.) %>% 
+  set_colnames(names(rocs)) %>% 
+  set_rownames(names(rocs))
+diag(roc_compare_mat) = 1
+for (i in 1:(length(rocs)-1)) {
+  for (j in (i+1):length(rocs)) {
+    roc_compare_mat[i, j] = roc.test(rocs[[i]], rocs[[j]], method='bootstrap')$p.value
+  }
+}
+
+roc_compare_mat
+
+```
+They're all the same. No difference in AUC. 
+
+```{r}
+auc_df = lapply(names(rocs), function(x) data.frame(model=x, 
+                                                    auc=rocs[[x]]$auc,
+                                                    low=rocs[[x]]$ci[1],
+                                                    hi=rocs[[x]]$ci[3])) %>% 
+  do.call(rbind, .)
+auc_df$model %<>% gsub(', ', '\n', .)
+
+auc_plt = 
+  ggplot(auc_df,
+         aes(x=' ',
+             fill=model)) +
+  geom_hline(aes(yintercept=0),
+             color='gray',
+             size=0.2) +
+  geom_col(aes(y=auc),
+           width=0.8,
+           position=position_dodge(width=1)) +
+  geom_errorbar(aes(ymin=low,
+                    ymax=hi),
+                width=0,
+                position=position_dodge(width=1)) +
+  labs(x = ' ',
+       y ='Area Under Receiver\nOperator Curve [auc]',
+       tag='c)')
+  
+auc_plt = 
+  gg_themer(auc_plt) +
+  scale_fill_brewer(palette='Dark2') +
+  theme(legend.position='None',
+        axis.ticks.x=element_blank())
+auc_plt
+```
+### Agreement between methods
+For identifying a high-priority site
+```{r}
+boot_cor = function(x, times=999, quantiles=c(0.025, 0.975), ...) {
+  obs = cor(x, use='complete.obs')#...)
+  
+  nobs = seq_len(nrow(x))
+  boot_samples = lapply(seq_len(times), function(y) sample(nobs, replace=TRUE))
+  boot = sapply(boot_samples, function(y) {
+    cor(x[y, ], use='complete.obs')#...)
+  },
+  simplify='array')
+  out = lapply(quantiles, 
+               function(y) apply(boot, c(1,2), quantile, y))
+  names(out) = quantiles
+  out$error = apply(simplify2array(out), c(1,2), function(y) diff(range(y))/2)
+  return(out)
+}
+
+gap_agree = apply(gaps, 2, function(x) x > quantile(x, 0.25, na.rm=TRUE))
+cor_gap_agree = cor(gap_agree, use='complete.obs')
+boot_cor_gap_agree = boot_cor(gap_agree, use='complete.obs')
+
+se = function(x) sd(x) / sqrt(length(x))
+err = 
+  boot_cor_gap_agree$error %>% 
+  .[upper.tri(., diag=FALSE)] %>% 
+  c(avg = mean(.),
+    sterr = se(.))
+```
+
+```{r}
+new_names = c(ISDA_CGAP = 'iSDA',
+              TOP_STAT_CGAP = 'Stationary\n(Top-Down)',
+              TOP_GW_CGAP = 'GWR\n(Top-Down)',
+              BOT_CGAP = 'Bottom-Up',
+              CGAP = 'Empirical')
+new_names1 = c(ISDA_CGAP = 'iSDA',
+               TOP_STAT_CGAP = 'Stationary',
+               TOP_GW_CGAP = 'GWR',
+               BOT_CGAP = 'Bottom-Up',
+               CGAP = 'Empirical')
+
+agree_df = agreement_mat
+rownames(agree_df) %<>% new_names1[.]
+colnames(agree_df) %<>% new_names[.]
+agree_df %<>% .[new_names1, new_names]
+agree_df[lower.tri(agree_df)] = NA
+agree_df %<>% .[, new_names[sort(seq_len(length(new_names)), decreasing=TRUE)]]
+
+corplt = ggcorrplot(agree_df,
+           outline.col=NA,
+           lab=TRUE,
+           lab_col='white',
+           lab_size=2.5,
+           tl.cex=7,
+           tl.srt=45,
+           digits=2) +
+  scale_fill_distiller(palette='Greens',
+                       limits=c(0,1),
+                       direction=1) +
+  labs(fill=NULL,
+       tag='c)') +
+  theme(panel.grid=element_blank(),
+        plot.tag=element_text(size=10),
+        legend.text=element_text(vjust=1))
+
+corplt
+```
+
+
+## Decision
+The bottom-up model performs slightly, but not significantly, worse at identifying 
+high-potential sites. All predictions were equally discriminatory across space, 
+actually - including raw iSDA. This refutes hypothesis 2. 
+
+Therefore, we will correct iSDA stock predictions
+
+
+# Fig S2 combined
+```{r fig.height=2.5, fig.width=6.5}
+grid_arrange_shared_legend <- function(...) {
+    require(grid)
+    plots <- list(...)
+    g <- ggplotGrob(plots[[1]] + theme(legend.position="bottom"))$grobs
+    legend <- g[[which(sapply(g, function(x) x$name) == "guide-box")]]
+    lheight <- sum(legend$height)
+    plots = lapply(plots, function(x) x + theme(legend.position='none'))
+    grid.arrange(
+        arrangeGrob(grobs=plots, nrow=1),
+        legend,
+        ncol=1,
+        heights = unit.c(unit(1, "npc") - lheight, lheight))
+}
+grid_arrange_shared_legend(cs_plt, roc_plt, corplt)
+```
+
+```{r}
+here(out_dir, "Figure S2 - ROC and agreement finding high-gap sites.jpg") %>% 
+  jpeg(height=2.5, width=6.5, units='in', res=300)
+grid_arrange_shared_legend(cs_plt, roc_plt, corplt)
+dev.off()
+```
+
+
+## Export
+```{r}
+cv_results = list(stock=stock_cv,
+                  potential=potential_cv,
+                  gap=gap_cv)
+current_stocks = models
+potential_stocks = potential_stocks
+
+fig3df = list(
+  gaps_cumsum = cs_gaps,
+  roc_df = rocs,
+  auc_df = auc_df
+)
+
+save(cv_results,
+     current_stocks,
+     potential_stocks,
+     fig3df,
+     file=here('Data', 'Part 3 - iSDA Corrections.Rdata'))
+```

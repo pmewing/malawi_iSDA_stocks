@@ -1,0 +1,288 @@
+---
+title: "Get iSDA Data"
+output: html_notebook
+author: pme
+
+---
+
+Get [iSDA](https://www.isda-africa.com/isdasoil/) data for the AOI, and draw some quick maps.
+Following Tomislav Hengl's [directions](https://gitlab.com/openlandmap/africa-soil-and-agronomy-data-cube).  Layers can be found on [zenodo](https://zenodo.org/search?page=1&size=50&q=iSDAsoil).
+
+# Setup
+
+## Variables and local data
+Note to specify overwriting
+```{r}
+set_crs = '+init=epsg:4326'  # WGS84
+set_projection = '+init=epsg:32736'  # utm 36S. For setting a buffer around the points.
+
+# locations
+in_dir = 'Data'
+dir_local = file.path(in_dir, 'Spatial')
+in_pt = 'Empirical Points.gpkg'  # cleaned up empirical data. Combined 2016 PANEL with later bulk density. 
+
+# mwi bounds. Download from the repository of your choice - ex. Malawi geospatial data portal. 
+in_bounds = "Malawi gadm36_MWI.gpkg"
+
+# Land suitability - provided in file
+in_suit = "LI_ETAL_2017_MW_AGRI_LAND_SUIT.tif"
+
+# DEM. Download from the source of your choice, example Google Earth.
+in_dem = "SRTM90_V4_MWI.tif"  # from Google Earth Engine via ree
+
+# output
+out_ras = 'ISDA_AR_MWI.tif'
+out_pt = 'Master Points.gpkg'
+out_dem = 'srtm90_MWI.tif'
+out_suit = 'ag_suitability_wgs84.tif'
+overwrite = FALSE
+```
+
+## iSDA
+Set up iSDA downloads, including unit conversions. Need to specify:
+
+1. Base URL preceded by vsicurl, which package `terra` recognizes
+2. Layers to access. The part of the name preceding '_m.....' can be found on zenodo.
+3. Transformations for each layer. Follow the format of the `switch()` function within the 
+local function `transform_isda()`. Again, see the zenodo site for each layer. 
+4. Units for each layer. 
+```{r}
+url_isda = '/vsicurl/https://s3.eu-central-1.wasabisys.com/africa-soil/layers30m/'
+
+
+in_isda = c(TC = 'sol_log.c_tot',      # convert by expm1(x/10)
+            SOC = 'sol_log.oc',        # convert by expm1(x/10)
+            BD = 'sol_db_od',          # requires multiplying by 10 to get kg m^-3.
+            PH = 'sol_ph_h2o',         # requires dividing by 10 to get pH units
+            SAND = 'sol_sand_tot_psa',
+            SILT = 'sol_silt_tot_psa',
+            CLAY = 'sol_clay_tot_psa')
+in_isda_tag = paste0('_m_30m_0..20cm_2001..2017_africa_epsg4326_v0.1.tif')
+
+
+in_isda_units = c(
+  TC = 'g/kg',
+  SOC = 'g/kg',
+  BD = 'g/cm3',
+  PH = 'pH',
+  SAND = 'g/g',
+  SILT = 'g/g',
+  CLAY = 'g/g')
+```
+
+Some iSDA layers need transforming to SI-adjacent units. 
+```{r}
+# Identify transformations here.
+transform_isda = function(layer, layer_name, units) {
+  if (is.null(attr(layer, 'units', exact=TRUE))) {
+    out = 
+      switch(layer_name,
+             'TC' = expm1(layer/10),
+             'SOC' = expm1(layer/10),
+             'BD' = layer/100,
+             'PH' = layer/10,
+             'SAND' = layer/100,
+             'SILT' = layer/100,
+             'CLAY' = layer/100)
+    
+    attr(out, 'units') = units[layer_name]
+  } else {
+    out = layer
+  }
+  
+  return(out)
+}
+
+```
+
+## Libraries
+```{r}
+libs = c('sf',        
+         'terra', 
+         'rgdal',
+         'magrittr',
+         'car',
+         'ggplot2',
+         'here')  
+```
+
+# Begin
+## Load libraries
+```{r message=FALSE}
+for (i in libs) {
+  if (!require(i, character.only=TRUE)) {
+    renv::install(i)
+    require(i, character.only=TRUE)
+  }}
+
+set_crs %<>% CRS
+set_projection %<>% CRS
+```
+
+## Set up AOI
+Include a 20 km buffer around points.
+```{r}
+pts = here(in_dir, in_pt) %>% 
+  st_read
+  # read.csv(header=TRUE) %>% 
+  # st_as_sf(coords=in_pt_coords,
+  #          crs=set_crs) 
+
+mwi = here(dir_local, in_bounds) %>% 
+  st_read(layer='gadm36_MWI_1') %>% 
+  .['NAME_1']
+
+ggplot(mwi) +
+  geom_sf() +
+  geom_sf(data=pts,
+          col='black',
+          size=0.2) +
+  labs(title='AOI') +
+  theme_minimal()
+```
+
+# Get iSDA
+crop to AOI and transform. This is slow, so broken down pretty carefully.
+
+First point terra to the layers on Zenodo
+```{r}
+isda_names = names(in_isda) %>% 
+  set_names(., .)
+
+ISDA = lapply(isda_names, function(x) {
+  # get the layer
+  paste('Working on', x) %>% 
+    message
+  layer = paste0(url_isda, in_isda[x], in_isda_tag) %>% 
+    rast %>% 
+    crop(mwi) %>% 
+    mask(mwi) %>% 
+    transform_isda(x, in_isda_units)
+  return(layer)
+})
+```
+
+# Combine into a raster stack and plot
+```{r}
+out = ISDA[[1]]
+for (i in 2:length(ISDA)) {
+  terra::add(out) = ISDA[[i]]
+}
+
+names(out) = paste(
+  isda_names,
+  sapply(ISDA, attr, 'units'),
+  sep='_')
+
+# if this fails, then run before repeating this cell:
+# ISDA[[1]] = ISDA[[1]][[1]]
+```
+
+
+```{r}
+plot(out)
+```
+
+
+```{r}
+here(dir_local, 'ISDA_AR_MWI.png') %>% 
+  png(height=11, width=8.5, units='in', res=300)
+plot(out)
+dev.off()
+
+```
+
+
+## Export as a geotiff
+```{r}
+# rename layers as ISDA_<property>
+names(out) %<>% strsplit('_') %>% 
+  sapply('[', 1) %>% 
+  paste0('ISDA_', .)
+here(dir_local, out_ras) %>% 
+  writeRaster(out, ., overwrite=overwrite)
+```
+
+# DEM
+```{r}
+dem = here(in_dir, dir_spatial, in_dem) %>% 
+  rast %>% 
+  crs_check(set_datum) %>% 
+  crop(mwi) %>% 
+  mask(mwi)
+plot(dem)
+```
+## Export
+```{r}
+here(dir_local, out_dem) %>% 
+  writeRaster(dem, ., overwrite=overwrite)
+```
+
+
+# Land suitability
+Reproject, resample, and export
+```{r}
+suit = here(dir_local, in_suit) %>% 
+  rast
+suit_mask = suit < 5
+suit_mask[!suit_mask] = NA
+terra::add(suit) = suit_mask
+names(suit) = c('suitability', 'masked')
+suit =
+  terra::project(suit, out, method='near', align=TRUE, mask=TRUE) %>% 
+  crop(out)
+plot(suit)
+```
+
+## Export
+```{r}
+here(dir_local, out_suit) %>% 
+  writeRaster(suit, ., overwrite=overwrite)
+```
+
+
+# Extract values at points
+```{r}
+pts_vect = vect(pts)
+for (x in isda_names) {
+  plt_name = paste0('ISDA_', x)
+  pts[, plt_name] = terra::extract(ISDA[[x]], pts_vect)[, 2]
+}
+pts[, 'ELEVATION'] = terra::extract(dem, pts_vect)[, 2]
+pts[, 'SUITABILITY'] = terra::extract(suit[[1]], pts_vect)[, 2]
+
+# convert bulk density to g/cm3
+pts[, 'BULK_DENSITY'] %<>% divide_by(1000)
+
+# convert texture to g/g
+pts[, 'SAND'] %<>% divide_by(100)
+pts[, 'SILT'] %<>% divide_by(100)
+pts[, 'CLAY'] %<>% divide_by(100)
+```
+
+## Plot
+```{r}
+is_isda = grepl('ISDA_', names(pts)) %>% 
+  names(pts)[.] %>% 
+  c('ELEVATION', 'SUITABILITY')
+plot(pts[is_isda])
+```
+
+
+```{r fig.height=8, fig.width=8, warning=FALSE, message=FALSE}
+as.data.frame(pts) %>% 
+  .[sample(seq_len(nrow(pts)), 300), is_isda] %>% 
+  scatterplotMatrix
+```
+
+
+## Export
+```{r}
+here(in_dir, out_pt) %>% 
+  st_write(pts, ., delete_layer=overwrite)
+```
+
+```{r}
+
+```
+

@@ -1,0 +1,347 @@
+---
+title: "Fig 1 - Study Site"
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding=encoding, output_dir=here::here('Results'))})
+output:
+  html_document:
+    toc: true
+    toc_depth: 5
+    toc_float: true
+    df_print: paged
+    code_folding: hide
+author: PME
+---
+
+Map of malawi, sample locations, and values of critical soil/edaphic properties in relation to other agricultural lands.
+
+# Load
+
+## Paths, Variables, Libraries
+
+Variables
+```{r}
+set_datum = 'epsg:4326'  # WGS84
+set_projection = 'epsg:32736'  # utm 36S.
+# output
+overwrite = FALSE
+# overwrite = TRUE
+```
+
+Paths
+```{r}
+# locations
+in_dir = 'Data'
+in_pt = 'Master Points.gpkg'
+# in_pt = 'AR_MWI_ISDA_points.gpkg'
+
+dir_spatial = 'Spatial' # in in_dir
+in_isda = 'ISDA_AR_MWI.tif'
+# in_suit = 'LI_ETAL_2017_MW_AGRI_LAND_SUIT.tif'  
+in_suit = "ag_suitability_wgs84.tif" # cropland suitability
+in_mwi = "Malawi gadm36_MWI.gpkg"
+in_dem = "srtm90_MWI.tif"  # from Google Earth Engine via ree
+
+# in_isda = c(
+#   'BD',
+#   'CLAY',
+#   'SAND',
+#   'SILT',
+#   'PH',
+#   'SOC')
+# in_isda = paste0("ISDA_", in_isda)
+# names(in_isda) = in_isda
+
+out_dir = 'Results'
+out_fig = 'Figure 1 - Study Area and Properties.jpg'
+
+```
+
+Libraries
+```{r}
+libs = c(
+  # Coding helpers
+  'here', 
+  'tidyr',
+  'magrittr',
+  
+  # spatial stuff
+  'sf',
+  'terra',
+  'stars',
+  
+  # Other modeling
+  'glmnet',
+  'quantreg',
+  
+  # plotting
+  'ggplot2',
+  'rasterVis',
+  'gridExtra'
+)
+```
+
+```{r message=FALSE}
+for (i in libs) {
+  if (!require(i, character.only=TRUE)) {
+    renv::install(i)
+    require(i, character.only=TRUE)
+}}
+
+resource = function() {
+  ll = here('Scripts', 'V3 Functions') %>% 
+  list.files(full.names=TRUE)
+  for (i in ll) {
+    source(i)
+  }
+}
+resource()
+```
+
+Versions
+```{r}
+sapply(libs, function(x) as.character(packageVersion(x))) %>% 
+  as.matrix %>% 
+  set_colnames(R.version.string)
+```
+
+## Load
+
+### Point Data
+```{r cache=TRUE}
+pt = here(in_dir, in_pt) %>% 
+  st_read
+```
+
+### iSDA
+load and convert units
+```{r fig.height=4, fig.width=8, warning=FALSE}
+isda = #paste0(in_isda, '_MWI.tif') %>% 
+  here(in_dir, dir_spatial, in_isda) %>% 
+  rast
+
+summary(isda)
+```
+Looks good. 
+
+### Malawi EPA bounds
+```{r}
+mwi = here(in_dir, dir_spatial, in_mwi) %>% 
+  st_read(layer='gadm36_MWI_1')
+```
+
+### Elevation
+```{r}
+dem = here(in_dir, dir_spatial, in_dem) %>% 
+  rast
+```
+
+### Suitability 
+```{r}
+suit = here(in_dir, dir_spatial, in_suit) %>% 
+  rast
+```
+
+
+### Check CRS and combine
+
+Add the DEM layer to iSDA for convenience - but keep effective resolution
+```{r}
+isda$ELEVATION = resample(dem, isda, method='near')
+```
+
+Project suitability and make a mask.
+```{r}
+suit_mask = suit[[2]]
+plot(suit_mask, col=c('red', 'white'))
+suit = suit[[1]]
+```
+
+### A few more functions
+```{r}
+gg_mapthemer = function(x, xlab='Long (E)', ylab='Lat (S)',
+                        coord_equal=FALSE) {
+  out = x +
+    labs(x=xlab,
+         y=ylab) +
+    theme_minimal() +
+    theme(axis.text.x=element_text(angle=90, 
+                                   hjust=1, 
+                                   vjust=0.5))
+  if (coord_equal) {
+    out = out + coord_equal()
+  }
+  return(out)
+}
+```
+
+# Map of study area
+```{r}
+mwi$LABEL = mwi$NAME_1 %>% 
+  sapply(function(x) ifelse(x %in% c('Dedza', 'Machinga', 'Ntcheu'), x, NA))
+
+pltdf = aggregate(isda, fact=10)
+# is_water = pltdf$ISDA_BD == 0
+# is_water[!is_water] = NA
+# is_water %<>% 
+#   st_as_stars %>% 
+#   st_as_sf(as.points=FALSE, merge=TRUE)
+
+focus_epa = mwi[!is.na(mwi$LABEL), ]
+
+suit_agg = aggregate(suit, 10, fun='modal') %>% 
+  resample(pltdf, method='near') %>% 
+  mask(pltdf[[1]])
+```
+
+
+```{r fig.height=8, fig.width=4}
+study_area = 
+  ggplot(mwi) +
+  # coord_sf(crs=st_crs(set_projection)) +
+  # political boundaries as background
+  scale_x_continuous(breaks=seq(33, 36, by=1)) +
+  scale_fill_distiller(palette='Greens', na.value=NA,
+                       limits=c(0.9, 5.1),
+                       direction=-1) +
+  scale_color_manual(values=c('tomato1', 'tomato3', 'tomato4')) +
+  
+  # stock level
+  # new_scale('fill') +
+  # water base layer
+  geom_sf(fill='skyblue1', 
+          color='skyblue1') +
+ 
+  # suitability
+  geom_stars(data=st_as_stars(suit_agg),
+             alpha=0.8) +
+  
+  # political boundaries
+  geom_sf(color='#666666',
+          alpha=0,
+          size=0.2) +
+  
+  # focus EPAs
+  geom_sf(data=focus_epa,
+          aes(color=LABEL),
+          fill=NA,
+          # alpha=0.2,
+          size=0.6) +
+  geom_sf(data=pt,
+          color='black',
+          size=0.2) +
+  labs(x=NULL,
+       y=NULL,
+       fill='Land Suitability\nClass',
+       color='District',
+       tag='a)') +
+  theme_minimal() +
+  theme(legend.position='bottom',
+        legend.direction='vertical',
+        axis.text=element_text(size=8),
+        legend.title=element_text(size=8),
+        legend.text=element_text(size=8),
+        title=element_text(size=9))
+study_area
+```
+
+# Representativeness of points.
+
+## Sample from across Malawi
+```{r}
+spl = mask(isda, suit_mask) %>% 
+  spatSample(5000, as.points=TRUE, na.rm=TRUE)
+spl$SAMPLEID = paste0('S', seq_len(nrow(spl)))
+```
+
+```{r}
+plot(isda$ELEVATION)
+points(spl, pch='.')
+lines(vect(mwi))
+```
+
+## Plot
+```{r}
+pltdf = data.frame(pt) %>% 
+  .[, names(spl)] %>% 
+  pivot_longer(cols=where('is.numeric'))
+pltdf$SOURCE = 'Visited'
+
+spl %<>% data.frame %>% 
+  pivot_longer(cols=where('is.numeric'))
+spl$SOURCE = 'Nation-wide'
+
+pltdf %<>% rbind(spl)
+
+prettynames = c(
+  SAND = expression(paste('Sand Content [g', ~g^-1, ']', sep='')),
+  SILT = expression(paste('Silt Content [g', ~g^-1, ']', sep='')),
+  CLAY = expression(paste('Clay Content [g', ~g^-1, ']', sep='')),
+  BD = expression(paste('Bulk Density [g', ~cm^-3, ']', sep='')),
+  PH = expression(paste('pH')),
+  SOC = expression(paste('Organic Carbon [g', ~kg^-1, ']', sep='')),
+  ELEVATION = expression(paste('Elevation [m]'))
+)
+pltdf$name %<>% 
+  gsub('ISDA_', '', .) %>% 
+  prettynames[.] %>% 
+  factor(., levels=prettynames)
+drop = is.na(pltdf$name)
+pltdf %<>% .[!drop, ]
+```
+
+```{r fig.height=6, fig.width=4}
+scale_setter = data.frame(SAMPLEID=NA,
+                          name='SOC',
+                          value=0,
+                          SOURCE=NA)
+scale_setter$name %<>%
+  prettynames[.] %>% 
+  factor(levels=prettynames)
+
+property_plot = 
+  ggplot(pltdf,
+       aes(x=value,
+           color=SOURCE)) +
+  scale_color_manual(values=c("#BBBBBB", "#666666")) +
+  facet_wrap(~name, 
+             scales='free', 
+             ncol=2, 
+             strip.position='bottom',
+             labeller='label_parsed') +
+  geom_blank(data=scale_setter) +
+  geom_density(adjust=1.7) +
+  labs(x=NULL,
+       y='Density',
+       color=NULL,
+       tag='b)') +
+  geom_hline(yintercept=0,
+             color='lightgray',
+             size=0.2) +
+  theme_minimal() +
+  theme(legend.position=c(0.75, 0.05),
+        axis.text=element_text(size=8),
+        title=element_text(size=9),
+        legend.text=element_text(size=8),
+        strip.text=element_text(size=8, vjust=1),
+        strip.placement='outside',
+        panel.grid=element_blank(),
+        axis.ticks=element_line(color='lightgray', 
+                                size=0.2))
+property_plot
+```
+
+```{r fig.height=6, fig.width=6.5}
+grid.arrange(grobs=list(study_area, property_plot),
+             widths=c(2,3), 
+             nrow=1)
+```
+# Export
+```{r}
+here(out_dir, out_fig) %>% 
+  jpeg(width=6.5, height=6.5, units='in', res=300)
+grid.arrange(grobs=list(study_area, property_plot),
+             widths=c(2,3), 
+             nrow=1)
+dev.off()
+```
+
